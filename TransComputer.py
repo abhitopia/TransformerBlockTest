@@ -1,3 +1,4 @@
+import math
 from torch import nn
 import torch
 from torch.nn import functional as F
@@ -160,8 +161,9 @@ class TransformerBlock(nn.Module):
         x = x + self.sa(self.ln1(x))
         x = x + self.ffwd(self.ln2(x))
         return x
+    
 
-class SymbolicComputeBlock(nn.Module):
+class ComputeBlock(nn.Module):
     def __init__(self, d_model, n_head, dropout: float = 0.0, is_causal: bool = False, num_symbols: int = 100, include_ffn: bool = False):
         super().__init__()
         self.d_model = d_model
@@ -186,7 +188,7 @@ class SymbolicComputeBlock(nn.Module):
             self.ffn = FeedFoward(self.head_dim, dropout=dropout)
 
 
-    def forward(self, x):
+    def forward(self, x, K: int):
         batch_size, seq_len, _ = x.size()
 
         x = x.view(batch_size, seq_len, self.num_heads, self.head_dim)  # (B, T, n_head, head_dim)
@@ -214,6 +216,139 @@ class SymbolicComputeBlock(nn.Module):
         return x
 
 
+# class ComputeBlock(nn.Module):
+#     """
+#     A ComputeBlock that, when unrolled K times, applies each residual with uniform 1/K scaling.
+    
+#     1) First attention (“symbol library”): each head attends over num_symbols.
+#     2) Second attention (“across heads”): for each token, its n_head head-vectors attend to each other.
+#     3) Optional FFN on each head-slice.
+    
+#     Usage:
+#         compute_block = UniformScaledSymbolicComputeBlock(...)
+#         p = prev_p  # shape (B, T, d_model)
+#         for _ in range(K):
+#             p = compute_block(p, K)
+#         next_p_i = p
+#     """
+#     def __init__(
+#         self,
+#         d_model: int,
+#         n_head: int,
+#         num_symbols: int,
+#         include_ffn: bool = False,
+#         dropout: float = 0.0,
+#         is_causal: bool = False
+#     ):
+#         super().__init__()
+#         assert d_model % n_head == 0, "d_model must be divisible by n_head"
+#         self.d_model      = d_model
+#         self.num_heads    = n_head
+#         self.head_dim     = d_model // n_head
+#         self.num_symbols  = num_symbols
+#         self.include_ffn  = include_ffn
+#         self.is_causal    = is_causal
+#         self.dropout_p    = dropout
+
+#         # Learned symbol-library embeddings: shape (1, num_symbols, 1, head_dim)
+#         self.symbol_embeddings = nn.Parameter(
+#             torch.randn(num_symbols, self.head_dim)
+#             .unsqueeze(0).unsqueeze(-2) * 0.02
+#         )
+
+#         # LayerNorm before first attention (per head-dimension)
+#         self.ln1 = nn.LayerNorm(self.head_dim)
+#         # Linear projections for Q (head_dim→head_dim) and K/V (head_dim→2*head_dim)
+#         self.q_proj  = nn.Linear(self.head_dim, self.head_dim, bias=False)
+#         self.kv_proj = nn.Linear(self.head_dim, 2 * self.head_dim, bias=False)
+
+#         # For second attention (“across heads”), project each head-slice to Q/K/V
+#         self.qkv_proj_h = nn.Linear(self.head_dim, 3 * self.head_dim, bias=False)
+
+#         # Learned gates for uniform 1/K scaling (initialized to 0 so tanh(0)=0)
+#         self.alpha_attn  = nn.Parameter(torch.ones(1)*math.atanh(0.01))  # gate for first attention
+#         self.alpha_attn2 = nn.Parameter(torch.ones(1)*math.atanh(0.01))  # gate for second attention
+#         if self.include_ffn:
+#             self.alpha_ffn = nn.Parameter(torch.ones(1)*math.atanh(0.01))  # gate for FFN
+#             self.ln2       = nn.LayerNorm(self.head_dim)
+#             self.ffn       = FeedFoward(self.head_dim, dropout=dropout)
+
+#     def forward(self, x: torch.Tensor, K: int) -> torch.Tensor:
+#         """
+#         Args:
+#             x: Tensor of shape (B, T, d_model)
+#             K: int, number of compute steps to unroll
+#         Returns:
+#             Tensor of shape (B, T, d_model) after one iteration;
+#             caller should loop K times.
+#         """
+#         B, T, D = x.size()
+#         device  = x.device
+
+#         # Compute uniform 1/K scaling factors
+#         scale1 = torch.tanh(self.alpha_attn)  / float(K)  # for first attention
+#         scale2 = torch.tanh(self.alpha_attn2) / float(K)  # for second attention
+#         if self.include_ffn:
+#             scale3 = torch.tanh(self.alpha_ffn) / float(K)  # for FFN
+
+#         # === 1) First attention: each head attends over the symbol library ===
+#         # Reshape x → (B, T, n_head, head_dim)
+#         x_heads = x.view(B, T, self.num_heads, self.head_dim)
+
+#         # Prepare Q from x: apply LayerNorm then linear
+#         q = self.q_proj(self.ln1(x_heads))  # shape (B, T, n_head, head_dim)
+
+#         # Prepare K, V from symbol_embeddings: (1, num_symbols, 2*head_dim)
+#         kv = self.kv_proj(self.symbol_embeddings)
+#         # Expand → (B, num_symbols, n_head, 2*head_dim)
+#         kv = kv.expand(B, -1, self.num_heads, -1)
+#         k, v = kv.split(self.head_dim, dim=-1)  # each: (B, num_symbols, n_head, head_dim)
+
+#         # Transpose to (B, n_head, T, head_dim) and (B, n_head, num_symbols, head_dim)
+#         q_a = q.transpose(1, 2)  # (B, n_head, T, head_dim)
+#         k_a = k.transpose(1, 2)  # (B, n_head, num_symbols, head_dim)
+#         v_a = v.transpose(1, 2)  # (B, n_head, num_symbols, head_dim)
+
+#         attn_out1 = F.scaled_dot_product_attention(
+#             q_a, k_a, v_a,
+#             dropout_p = self.dropout_p,
+#             is_causal = self.is_causal
+#         )  # → (B, n_head, T, head_dim)
+
+#         # Back to (B, T, n_head, head_dim)
+#         attn_out1 = attn_out1.permute(0, 2, 1, 3).contiguous()
+
+#         # Residual #1 with uniform 1/K scaling
+#         x_heads = x_heads + scale1 * attn_out1  # (B, T, n_head, head_dim)
+
+#         # === 2) Second attention: “across heads” for each token ===
+#         # Project x_heads → Q/K/V (shape (B, T, n_head, 3*head_dim))
+#         qkv_h = self.qkv_proj_h(x_heads)
+#         # Split into q_h, k_h, v_h each of shape (B, T, n_head, head_dim)
+#         q_h, k_h, v_h = qkv_h.split(self.head_dim, dim=-1)
+
+#         # Directly call attention treating T as num_heads and H as seq_len:
+#         # q_h is (B, T, H, head_dim) → batch=B, num_heads=T, seq_len=H
+#         attn_out2 = F.scaled_dot_product_attention(
+#             q_h,        # (B, T, H, head_dim)
+#             k_h,        # (B, T, H, head_dim)
+#             v_h,        # (B, T, H, head_dim)
+#             dropout_p = self.dropout_p,
+#             is_causal = False
+#         )  # → (B, T, H, head_dim)
+
+#         # Residual #2 with uniform 1/K scaling
+#         x_heads = x_heads + scale2 * attn_out2  # (B, T, H, head_dim)
+
+#         # === 3) Optional Feed-Forward on each head-slice ===
+#         if self.include_ffn:
+#             ff_out  = self.ffn(self.ln2(x_heads))                 # (B, T, n_head, head_dim)
+#             # Residual #3 with uniform 1/K scaling
+#             x_heads = x_heads + scale3 * ff_out
+
+#         # Restore shape to (B, T, d_model) and return
+#         return x_heads.view(B, T, self.d_model)
+
 @dataclass
 class Config:
     # Perception
@@ -221,7 +356,6 @@ class Config:
     causal: bool = True
 
     # Computer
-    n_compute_steps: int = 5
     n_symbols: int = 100
     include_ffn: bool = False
     shared_compute_block: bool = True
@@ -252,12 +386,12 @@ class TransComputer(nn.Module):
                                                       dropout=config.dropout, 
                                                       is_causal=config.causal) for _ in range(config.n_layers)])
         
-        compute_blocks = [SymbolicComputeBlock(d_model=config.d_model, 
-                                                n_head=config.n_heads, 
-                                                dropout=config.dropout, 
-                                                is_causal=False,
-                                                num_symbols=config.n_symbols,
-                                                include_ffn=config.include_ffn) for _ in range(config.n_layers)]
+        compute_blocks = [ComputeBlock(d_model=config.d_model, 
+                                        n_head=config.n_heads, 
+                                        dropout=config.dropout, 
+                                        is_causal=False,
+                                        num_symbols=config.n_symbols,
+                                        include_ffn=config.include_ffn) for _ in range(config.n_layers)]
         
         perception_gxattns = [GatedCrossAttention(embed_dim=config.d_model, 
                                                 num_heads=config.n_heads, 
@@ -299,7 +433,7 @@ class TransComputer(nn.Module):
         key_padding_mask = pos >= input_len_exp  # broadcasts to (B, PerL)
         return key_padding_mask
 
-    def forward(self, x, prog_ids=None, input_lens=None):
+    def forward(self, x, prog_ids=None, input_lens=None, compute_steps: int = 1):
         """
         x: (B, T, D)
         prog_ids: (B)
@@ -326,7 +460,14 @@ class TransComputer(nn.Module):
 
         for i in range(self.config.n_layers):
             next_h_i = self.perception_blocks[i](prev_h)
-            next_p_i = self.compute_blocks[i](prev_p)
+            # next_p_i = self.compute_blocks[i](prev_p)
+
+            # Recursive compute block
+            p = prev_p  # (B, N_prog, D)
+            for _ in range(compute_steps):
+                p = self.compute_blocks[i](p, compute_steps)
+            next_p_i = p
+
             next_h = self.perception_gated_xattn[i](next_h_i, next_p_i)
             next_p = self.compute_gated_xattn[i](next_p_i, next_h_i, key_padding_mask=key_padding_mask)
             prev_h = next_h

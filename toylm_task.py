@@ -14,21 +14,26 @@ n_embd = 64
 n_head = 4
 n_layer = 4
 dropout = 0.0
+# New option: if True, loss is applied only to last T/2 tokens and input_lens are passed to TransComputer
+# This treats the first T/2 tokens as input and the last T/2 tokens as output for training
+use_input_output_split = True
 
 # ---TransComputer Config---
 config = Config(
     n_layers=n_layer,
     causal=True,
-    n_compute_steps=1,
     n_symbols=100,
     include_ffn=False,
     shared_compute_block=True,
-    n_prog_tokens=0,
+    n_prog_tokens=4,
     n_programs=1,
     d_model=n_embd,
     n_heads=n_head,
     dropout=dropout,
 )
+
+n_compute_steps=4
+
 # ------------
 
 torch.manual_seed(1337)
@@ -94,16 +99,35 @@ class BigramLanguageModel(nn.Module):
         tok_emb = self.token_embedding_table(idx) # (B,T,C)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
         x = tok_emb + pos_emb # (B,T,C)
-        x = self.trans_computer(x) # (B,T,C)
+        
+        # Prepare input_lens for TransComputer if using input/output split
+        if use_input_output_split:
+            input_lens = torch.full((B,), T // 2, dtype=torch.long, device=device)
+            x = self.trans_computer(x, input_lens=input_lens, compute_steps=n_compute_steps) # (B,T,C)
+        else:
+            x = self.trans_computer(x) # (B,T,C)
+            
         logits = self.lm_head(x) # (B,T,vocab_size)
 
         if targets is None:
             loss = None
         else:
             B, T, C = logits.shape
-            logits = logits.view(B*T, C)
-            targets = targets.view(B*T)
-            loss = F.cross_entropy(logits, targets)
+            
+            if use_input_output_split:
+                # Apply loss only to the last T/2 tokens
+                output_start = T // 2
+                logits_output = logits[:, output_start:, :]  # (B, T/2, C)
+                targets_output = targets[:, output_start:]   # (B, T/2)
+                
+                logits_flat = logits_output.contiguous().view(-1, C)  # (B*T/2, C)
+                targets_flat = targets_output.contiguous().view(-1)   # (B*T/2,)
+                loss = F.cross_entropy(logits_flat, targets_flat)
+            else:
+                # Original behavior: apply loss to all tokens
+                logits = logits.view(B*T, C)
+                targets = targets.view(B*T)
+                loss = F.cross_entropy(logits, targets)
 
         return logits, loss
 
@@ -128,6 +152,9 @@ model = BigramLanguageModel()
 m = model.to(device)
 # print the number of parameters in the model
 print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
+print(f"Training mode: {'Input/Output Split' if use_input_output_split else 'Standard'}")
+if use_input_output_split:
+    print(f"Loss applied to last {block_size//2} tokens only (treating first {block_size//2} as input)")
 
 # create a PyTorch optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
