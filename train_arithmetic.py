@@ -22,6 +22,7 @@ from typing import Dict, List, Optional
 from dataclasses import dataclass, asdict
 import typer
 from typing_extensions import Annotated
+from rich import print
 
 from arithmetic_model import ArithmeticModel, ArithmeticModelConfig
 from arithmatic_dataset import (
@@ -344,9 +345,15 @@ class ArithmeticTrainer:
         op_symbols = {0: "+", 1: "-", 2: "*"}
         
         with torch.no_grad():
-            # Get a few samples from validation set
-            batch_dict = next(iter(self.val_loader))
-            batch_dict = self._move_batch_to_device(batch_dict)
+            # Check if validation loader has any batches
+            try:
+                batch_dict = next(iter(self.val_loader))
+                batch_dict = self._move_batch_to_device(batch_dict)
+            except StopIteration:
+                # No validation batches available (due to drop_last=True)
+                # Use training data instead
+                batch_dict = next(iter(self.train_loader))
+                batch_dict = self._move_batch_to_device(batch_dict)
             
             count = 0
             for seq_len, batch_data in batch_dict.items():

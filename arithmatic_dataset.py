@@ -380,7 +380,8 @@ class ArithmeticDatasetGenerator:
 def create_dataloaders(datasets: Dict[int, ArithmeticDataset], 
                       batch_size: int = 32,
                       shuffle: bool = True,
-                      num_workers: int = 0) -> Dict[int, DataLoader]:
+                      num_workers: int = 0,
+                      drop_last: bool = True) -> Dict[int, DataLoader]:
     """Create DataLoaders for each sequence length bucket (for separate processing)"""
     dataloaders = {}
     
@@ -391,7 +392,8 @@ def create_dataloaders(datasets: Dict[int, ArithmeticDataset],
             shuffle=shuffle,
             num_workers=num_workers,
             pin_memory=True if torch.cuda.is_available() else False,
-            collate_fn=collate_batch
+            collate_fn=collate_batch,
+            drop_last=drop_last
         )
         dataloaders[seq_len] = dataloader
     
@@ -465,7 +467,8 @@ def multi_length_collate_batch(batch):
 def create_unified_dataloader(datasets: Dict[int, ArithmeticDataset],
                              batch_size: int = 32,
                              shuffle: bool = True,
-                             num_workers: int = 0) -> DataLoader:
+                             num_workers: int = 0,
+                             drop_last: bool = True) -> DataLoader:
     """
     Create a single unified DataLoader that handles multiple sequence lengths.
     
@@ -477,6 +480,7 @@ def create_unified_dataloader(datasets: Dict[int, ArithmeticDataset],
         batch_size: Total batch size (will be distributed across sequence lengths)
         shuffle: Whether to shuffle samples
         num_workers: Number of DataLoader workers
+        drop_last: Whether to drop incomplete batches (recommended for compilation)
         
     Returns:
         Single DataLoader that yields batches grouped by sequence length
@@ -489,7 +493,8 @@ def create_unified_dataloader(datasets: Dict[int, ArithmeticDataset],
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=True if torch.cuda.is_available() else False,
-        collate_fn=multi_length_collate_batch
+        collate_fn=multi_length_collate_batch,
+        drop_last=drop_last
     )
 
 
