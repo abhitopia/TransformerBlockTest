@@ -577,6 +577,51 @@ class ArithmeticTrainer:
             best_path = os.path.join(self.output_dir, "best_model.pt")
             torch.save(checkpoint, best_path)
             print(f"New best model saved with accuracy: {self.best_val_accuracy:.4f}")
+        
+        # Clean up old checkpoints (keep only 3 most recent + best)
+        self.cleanup_old_checkpoints()
+    
+    def cleanup_old_checkpoints(self, keep_recent: int = 3):
+        """
+        Clean up old checkpoints, keeping only the most recent ones and the best model.
+        
+        Args:
+            keep_recent: Number of most recent checkpoints to keep (default: 3)
+        """
+        try:
+            # Find all checkpoint files (excluding best_model.pt)
+            checkpoint_pattern = os.path.join(self.output_dir, "checkpoint_step_*.pt")
+            checkpoint_files = []
+            
+            # Get all checkpoint files with their step numbers
+            for filepath in os.listdir(self.output_dir):
+                if filepath.startswith("checkpoint_step_") and filepath.endswith(".pt"):
+                    try:
+                        # Extract step number from filename
+                        step_str = filepath.replace("checkpoint_step_", "").replace(".pt", "")
+                        step_num = int(step_str)
+                        full_path = os.path.join(self.output_dir, filepath)
+                        checkpoint_files.append((step_num, full_path))
+                    except ValueError:
+                        # Skip files that don't match the expected pattern
+                        continue
+            
+            # Sort by step number (most recent first)
+            checkpoint_files.sort(key=lambda x: x[0], reverse=True)
+            
+            # Keep only the most recent checkpoints
+            if len(checkpoint_files) > keep_recent:
+                files_to_delete = checkpoint_files[keep_recent:]
+                
+                for step_num, filepath in files_to_delete:
+                    try:
+                        os.remove(filepath)
+                        print(f"Cleaned up old checkpoint: checkpoint_step_{step_num}.pt")
+                    except OSError as e:
+                        print(f"Warning: Could not delete {filepath}: {e}")
+        
+        except Exception as e:
+            print(f"Warning: Checkpoint cleanup failed: {e}")
     
     def train(self):
         """Main training loop"""
