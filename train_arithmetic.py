@@ -59,6 +59,7 @@ class TrainingConfig:
     # Data generation optimization
     use_cache: bool = True
     num_workers: int = None  # None for auto-detection
+    max_workers: int = 4  # Conservative default for memory-limited systems
     
     # Training
     batch_size: int = 32
@@ -747,6 +748,7 @@ def main(
     # Data generation optimization
     no_cache: Annotated[bool, typer.Option("--no-cache", help="Disable dataset caching")] = False,
     num_workers: Annotated[Optional[int], typer.Option(help="Number of parallel workers for dataset generation (None for auto)")] = None,
+    max_workers: Annotated[int, typer.Option(help="Maximum number of workers (useful for limited memory systems)")] = 4,
     
     # Training parameters
     batch_size: Annotated[int, typer.Option(help="Batch size")] = 32,
@@ -833,6 +835,7 @@ def main(
         # Data generation optimization
         use_cache=not no_cache,
         num_workers=num_workers,
+        max_workers=max_workers,
     )
     
     # Create trainer (this will create the output directory)

@@ -569,8 +569,20 @@ class ArithmeticDatasetGenerator:
             
             # Collect final results
             for result in results:
-                samples, worker_id, attempts = result.get()
-                all_samples.extend(samples)
+                plain_samples, worker_id, attempts = result.get()
+                
+                # Convert plain Python data back to ArithmeticSample objects
+                for plain_sample in plain_samples:
+                    sample = ArithmeticSample(
+                        op_id=plain_sample['op_id'],
+                        operand1=plain_sample['operand1'],
+                        operand2=plain_sample['operand2'],
+                        result=plain_sample['result'],
+                        token_ids=torch.tensor(plain_sample['token_ids'], dtype=torch.long),
+                        input_len=plain_sample['input_len']
+                    )
+                    all_samples.append(sample)
+                
                 total_attempts += attempts
         
         # Ensure progress bar reaches 100%
@@ -1171,7 +1183,20 @@ def _generate_samples_worker_with_progress(args):
         with progress_lock:
             progress_counter.value += (len(samples) - last_progress_update)
     
-    return samples, worker_id, attempts
+    # Convert ArithmeticSample objects to plain Python data to avoid PyTorch tensor sharing issues
+    plain_samples = []
+    for sample in samples:
+        plain_sample = {
+            'op_id': sample.op_id,
+            'operand1': sample.operand1,
+            'operand2': sample.operand2,
+            'result': sample.result,
+            'token_ids': sample.token_ids.tolist(),  # Convert tensor to list
+            'input_len': sample.input_len
+        }
+        plain_samples.append(plain_sample)
+    
+    return plain_samples, worker_id, attempts
 
 
 # Example usage and testing
