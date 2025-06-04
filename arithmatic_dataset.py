@@ -7,6 +7,13 @@ from torch.utils.data import Dataset, DataLoader
 import itertools
 import hashlib
 
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+    print("Warning: tqdm not available. Install with: pip install tqdm")
+
 
 class BinaryOp(Enum):
     ADD = 0
@@ -319,6 +326,20 @@ class ArithmeticDatasetGenerator:
         attempts = 0
         max_attempts = num_samples * 10  # Prevent infinite loops
         
+        # Create progress bar if tqdm is available
+        split_name = "train" if is_train else "val"
+        if TQDM_AVAILABLE:
+            pbar = tqdm(total=num_samples, 
+                       desc=f"Generating {split_name} samples", 
+                       unit="samples",
+                       ncols=100,
+                       miniters=max(1, num_samples // 100),  # Update less frequently for large datasets
+                       dynamic_ncols=True,
+                       leave=True)  # Keep progress bar after completion
+        else:
+            print(f"Generating {num_samples} {split_name} samples (no progress bar - install tqdm)...")
+            pbar = None
+        
         while len(samples) < num_samples and attempts < max_attempts:
             sample = self._generate_random_sample(rng)
             
@@ -335,8 +356,17 @@ class ArithmeticDatasetGenerator:
                           s.operand2 == sample.operand2 and 
                           s.op_id == sample.op_id for s in samples):
                     samples.append(sample)
+                    
+                    # Update progress bar
+                    if TQDM_AVAILABLE and pbar is not None:
+                        pbar.update(1)
+                        pbar.set_postfix({"attempts": attempts, "efficiency": f"{len(samples)/max(attempts, 1):.3f}"})
             
             attempts += 1
+        
+        # Close progress bar
+        if TQDM_AVAILABLE and pbar is not None:
+            pbar.close()
         
         if len(samples) < num_samples:
             print(f"Warning: Only generated {len(samples)}/{num_samples} samples for {'train' if is_train else 'val'}")
@@ -360,7 +390,20 @@ class ArithmeticDatasetGenerator:
         rng = random.Random(seed)
         sequence_lengths = []
         
-        for _ in range(sample_size):
+        # Create progress bar if tqdm is available
+        if TQDM_AVAILABLE:
+            sample_iter = tqdm(range(sample_size), 
+                             desc="Analyzing sequence lengths", 
+                             unit="samples", 
+                             ncols=100,
+                             miniters=max(1, sample_size // 50),  # Update every 2%
+                             dynamic_ncols=True,
+                             leave=False)  # Don't clutter with this progress bar
+        else:
+            sample_iter = range(sample_size)
+            print(f"Analyzing {sample_size} samples for sequence lengths (no progress bar - install tqdm)...")
+        
+        for _ in sample_iter:
             sample = self._generate_random_sample(rng)
             sequence_lengths.append(len(sample.token_ids))
         
@@ -419,6 +462,10 @@ class ArithmeticDatasetGenerator:
         Returns:
             Tuple of (train_datasets_dict, val_datasets_dict) where keys are sequence lengths
         """
+        print("=" * 60)
+        print("🚀 DATASET GENERATION STARTED")
+        print("=" * 60)
+        
         # Validate sample sizes vs total combinations
         self._validate_sample_sizes(train_samples, val_samples)
         
@@ -434,15 +481,20 @@ class ArithmeticDatasetGenerator:
                 print(f"⚠️  WARNING: Max bucket size ({max(fixed_seq_lengths)}) < theoretical max ({self.max_seq_len})")
                 print("   Some sequences might be truncated!")
         
-        print(f"Generating {train_samples} train and {val_samples} val samples...")
+        print(f"\n📊 Generating {train_samples:,} train and {val_samples:,} val samples...")
         
         # Generate train and val samples separately
+        print("\n[1/3] Generating training samples...")
         train_samples_list = self._generate_samples_for_split(
             train_samples, is_train=True, train_ratio=train_ratio, seed=seed
         )
+        
+        print("\n[2/3] Generating validation samples...")
         val_samples_list = self._generate_samples_for_split(
             val_samples, is_train=False, train_ratio=train_ratio, seed=seed + 1
         )
+        
+        print("\n[3/3] Creating datasets and organizing by sequence length...")
         
         # Group samples by sequence length
         def group_by_length(samples):
@@ -476,7 +528,11 @@ class ArithmeticDatasetGenerator:
             if val_samples_for_len:
                 val_datasets[seq_len] = ArithmeticDataset(val_samples_for_len, seq_len)
             
-            print(f"Sequence length {seq_len}: {len(train_samples_for_len)} train, {len(val_samples_for_len)} val samples")
+            print(f"  Sequence length {seq_len}: {len(train_samples_for_len)} train, {len(val_samples_for_len)} val samples")
+        
+        print("\n✅ DATASET GENERATION COMPLETED!")
+        print(f"   Total: {sum(len(ds) for ds in train_datasets.values())} train, {sum(len(ds) for ds in val_datasets.values())} val samples")
+        print("=" * 60)
         
         return train_datasets, val_datasets
 
