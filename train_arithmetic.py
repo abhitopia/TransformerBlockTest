@@ -41,7 +41,7 @@ from arithmatic_dataset import (
     ArithmeticTokenizer
 )
 
-app = typer.Typer(help="Train ArithmeticModel using TransComputer")
+app = typer.Typer(help="Train ArithmeticModel using TransComputer", pretty_exceptions_show_locals=False)
 
 @dataclass
 class TrainingConfig:
