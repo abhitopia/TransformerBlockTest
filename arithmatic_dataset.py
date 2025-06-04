@@ -141,6 +141,115 @@ class ArithmeticDatasetGenerator:
         self.min_operand = 1  # Avoid 0 to prevent trivial cases
         self.max_operand = 10 ** max_digits - 1
         
+        # Calculate theoretical max sequence length
+        self.max_seq_len = self.calculate_max_seq_len()
+        
+        # Calculate total possible combinations
+        self.total_combinations = self._calculate_total_combinations()
+    
+    def calculate_max_seq_len(self) -> int:
+        """
+        Calculate theoretical maximum sequence length based on max_digits and operations.
+        
+        Format: "operand1 operand2 = result"
+        Example: "99 99 = 9801" (for 2-digit operands)
+        """
+        # Operand lengths
+        operand1_len = self.max_digits  # e.g., "99" = 2 tokens
+        operand2_len = self.max_digits  # e.g., "99" = 2 tokens
+        
+        # Calculate maximum result length for each operation
+        max_result_lens = []
+        
+        for op in self.operations:
+            if op == BinaryOp.ADD:
+                # Max: 999 + 999 = 1998 (max_digits + 1)
+                max_result_len = self.max_digits + 1
+            elif op == BinaryOp.SUB:
+                # Max: 999 - 1 = 998 (max_digits)
+                max_result_len = self.max_digits
+            elif op == BinaryOp.MUL:
+                # Max: 999 * 999 = 998001 (2 * max_digits)
+                max_result_len = 2 * self.max_digits
+            else:
+                # Default fallback
+                max_result_len = 2 * self.max_digits
+                
+            max_result_lens.append(max_result_len)
+        
+        # Get the maximum across all operations
+        max_result_len = max(max_result_lens)
+        
+        # Calculate total sequence length:
+        # operand1 + space + operand2 + space + equals + space + result
+        total_len = (
+            operand1_len +      # e.g., "99"
+            1 +                 # space
+            operand2_len +      # e.g., "99" 
+            1 +                 # space
+            1 +                 # equals sign
+            1 +                 # space after equals
+            max_result_len      # result (e.g., "9801")
+        )
+        
+        # Add minimal padding for bucketing efficiency (round up to multiple of 4)
+        return ((total_len + 3) // 4) * 4
+    
+    def _calculate_total_combinations(self) -> int:
+        """
+        Calculate total number of possible combinations.
+        
+        Returns:
+            Total number of unique (operand1, operand2, operation) combinations
+        """
+        # Number of possible operand pairs
+        num_operand_pairs = (self.max_operand - self.min_operand + 1) ** 2
+        
+        # Multiply by number of operations
+        return num_operand_pairs * len(self.operations)
+    
+    def _validate_sample_sizes(self, train_samples: int, val_samples: int) -> None:
+        """
+        Validate that sample sizes are reasonable compared to total combinations.
+        
+        Args:
+            train_samples: Number of training samples
+            val_samples: Number of validation samples
+        """
+        total_samples = train_samples + val_samples
+        coverage_ratio = total_samples / self.total_combinations
+        
+        print(f"\n=== Sample Size Validation ===")
+        print(f"Max digits: {self.max_digits}")
+        print(f"Operations: {[op.name for op in self.operations]}")
+        print(f"Operand range: {self.min_operand} to {self.max_operand}")
+        print(f"Total possible combinations: {self.total_combinations:,}")
+        print(f"Training samples: {train_samples:,}")
+        print(f"Validation samples: {val_samples:,}")
+        print(f"Total samples: {total_samples:,}")
+        print(f"Coverage ratio: {coverage_ratio:.4f} ({coverage_ratio*100:.2f}%)")
+        print(f"Theoretical max sequence length: {self.max_seq_len} tokens")
+        
+        # Warnings and recommendations
+        if coverage_ratio > 0.5:
+            print("⚠️  WARNING: Using >50% of possible combinations - high risk of overfitting!")
+            print("   Consider reducing sample size or increasing max_digits")
+        elif coverage_ratio > 0.1:
+            print("⚠️  WARNING: Using >10% of possible combinations - moderate risk of overfitting")
+            print("   Consider monitoring validation performance carefully")
+        elif coverage_ratio < 0.001:
+            print("ℹ️  INFO: Using <0.1% of combinations - very low overfitting risk")
+        else:
+            print("✅ Good: Using reasonable fraction of combinations")
+        
+        # Check if we have enough combinations
+        min_recommended = total_samples * 10  # At least 10x more combinations than samples
+        if self.total_combinations < min_recommended:
+            print(f"⚠️  WARNING: Consider increasing max_digits to get more combinations")
+            print(f"   Recommended: at least {min_recommended:,} combinations")
+        
+        print("=" * 30)
+    
     def _compute_result(self, op1: int, op2: int, operation: BinaryOp) -> Optional[int]:
         """Compute result of binary operation"""
         if operation == BinaryOp.ADD:
@@ -294,7 +403,7 @@ class ArithmeticDatasetGenerator:
                        val_samples: int = 2000,
                        train_ratio: float = 0.8,
                        fixed_seq_lengths: Optional[List[int]] = None,
-                       auto_detect_lengths: bool = True,
+                       auto_detect_lengths: bool = False,
                        seed: int = 42) -> Tuple[Dict[int, ArithmeticDataset], Dict[int, ArithmeticDataset]]:
         """
         Create train/val datasets with no overlap using sampling
@@ -304,31 +413,26 @@ class ArithmeticDatasetGenerator:
             val_samples: Number of validation samples to generate
             train_ratio: Ratio used for hash-based splitting (ensures no overlap)
             fixed_seq_lengths: List of fixed sequence lengths for bucketing (optional)
-            auto_detect_lengths: Whether to automatically detect optimal sequence lengths
+            auto_detect_lengths: Whether to automatically detect optimal sequence lengths (deprecated)
             seed: Random seed for reproducible generation
             
         Returns:
             Tuple of (train_datasets_dict, val_datasets_dict) where keys are sequence lengths
         """
-        if fixed_seq_lengths is None and auto_detect_lengths:
-            # Automatically detect optimal sequence length buckets
-            fixed_seq_lengths = self._auto_detect_sequence_lengths(
-                sample_size=min(1000, (train_samples + val_samples) // 10),
-                seed=seed
-            )
-        elif fixed_seq_lengths is None:
-            # Fall back to default buckets based on max_digits
-            if self.max_digits <= 1:
-                fixed_seq_lengths = [8, 12]  # "1 2 = 3" vs "9 9 = 81"
-            elif self.max_digits <= 2:
-                fixed_seq_lengths = [12, 16, 20]  # Different result lengths
-            elif self.max_digits <= 5:
-                fixed_seq_lengths = [16, 24, 32, 40]
-            else:
-                fixed_seq_lengths = [24, 32, 48, 64]
-            print(f"Using default sequence length buckets: {fixed_seq_lengths}")
+        # Validate sample sizes vs total combinations
+        self._validate_sample_sizes(train_samples, val_samples)
+        
+        if fixed_seq_lengths is None:
+            # Use theoretical max sequence length (much more principled than auto-detection)
+            fixed_seq_lengths = [self.max_seq_len]
+            print(f"Using theoretical max sequence length: {self.max_seq_len} tokens")
+            print(f"  (Based on max_digits={self.max_digits} and operations={[op.name for op in self.operations]})")
         else:
             print(f"Using provided sequence length buckets: {fixed_seq_lengths}")
+            # Warn if provided lengths might be too small
+            if max(fixed_seq_lengths) < self.max_seq_len:
+                print(f"⚠️  WARNING: Max bucket size ({max(fixed_seq_lengths)}) < theoretical max ({self.max_seq_len})")
+                print("   Some sequences might be truncated!")
         
         print(f"Generating {train_samples} train and {val_samples} val samples...")
         

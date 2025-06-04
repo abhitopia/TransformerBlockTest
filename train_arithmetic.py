@@ -55,7 +55,7 @@ class TrainingConfig:
     val_steps: int = 100
     
     # Model compilation
-    compile_model: bool = True
+    compile_model: bool = False
     
     # Logging
     log_every_steps: int = 100
@@ -120,20 +120,22 @@ class ArithmeticTrainer:
         op_mapping = {"ADD": BinaryOp.ADD, "SUB": BinaryOp.SUB, "MUL": BinaryOp.MUL}
         operations = [op_mapping[op] for op in self.training_config.operations]
         
-        # Update model config with correct number of operations
-        self.model_config.num_operations = len(operations)
-        
         # Create dataset generator
         self.generator = ArithmeticDatasetGenerator(
             max_digits=self.training_config.max_digits,
             operations=operations
         )
         
-        # Generate datasets
+        # Update model config with correct number of operations and theoretical max sequence length
+        self.model_config.num_operations = len(operations)
+        self.model_config.max_seq_len = self.generator.max_seq_len
+        print(f"Set max_seq_len to {self.model_config.max_seq_len} (theoretical max based on {self.training_config.max_digits} digits)")
+        
+        # Generate datasets using theoretical max sequence length
         train_datasets, val_datasets = self.generator.create_datasets(
             train_samples=self.training_config.train_samples,
             val_samples=self.training_config.val_samples,
-            auto_detect_lengths=True,
+            auto_detect_lengths=False,  # Use theoretical max instead
             seed=42
         )
         
@@ -166,6 +168,8 @@ class ArithmeticTrainer:
         
         # Compile model for performance (if requested and supported)
         if self.training_config.compile_model:
+            # DEBUGGING: Uncomment the next line to temporarily disable compilation
+            # self.training_config.compile_model = False
             try:
                 print("Compiling model with inductor backend...")
                 # Use inductor backend with maximum optimizations

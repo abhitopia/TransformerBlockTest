@@ -21,6 +21,7 @@ class ArithmeticModelConfig:
     n_heads: int = 8
     n_layers: int = 6
     dropout: float = 0.1
+    max_seq_len: int = 32  # Sufficient for arithmetic tasks (longest sequences ~16 tokens)
     
     # TransComputer specific
     n_symbols: int = 100
@@ -59,6 +60,9 @@ class ArithmeticModel(nn.Module):
         
         # Token embeddings
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
+        
+        # Positional embeddings
+        self.pos_embedding = nn.Embedding(config.max_seq_len, config.d_model)
         
         # TransComputer configuration
         tc_config = TransComputerConfig(
@@ -118,9 +122,14 @@ class ArithmeticModel(nn.Module):
         # Embed tokens
         x = self.token_embedding(token_ids)  # (B, T, d_model)
         
+        # Positional embeddings (create position IDs dynamically based on input size)
+        seq_len = x.size(1)
+        positions = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(x.size(0), -1)  # (B, T)
+        pos_embedding = self.pos_embedding(positions)  # (B, T, d_model)
+        
         # Forward through TransComputer
         hidden_states = self.transcomputer.forward(
-            x=x,
+            x=x + pos_embedding,
             prog_ids=op_ids,
             input_lens=input_lens,
             compute_steps=compute_steps or self.config.compute_steps
