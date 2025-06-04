@@ -582,7 +582,7 @@ class ArithmeticTrainer:
             
             # Log to wandb
             if self.use_wandb:
-                wandb.log({
+                log_dict = {
                     "train/loss": metrics['loss'],
                     "train/sequence_accuracy": metrics['sequence_accuracy'],
                     "train/token_accuracy": metrics['token_accuracy'],
@@ -590,7 +590,15 @@ class ArithmeticTrainer:
                     "train/num_tokens": metrics['num_tokens'],
                     "train/num_sequences": metrics['num_sequences'],
                     "step": step
-                })
+                }
+                
+                # Add gate alphas if in TransComputer mode
+                if hasattr(self.model, 'transcomputer'):
+                    gate_alphas = self.get_gate_alphas()
+                    for key, value in gate_alphas.items():
+                        log_dict[f"gates/{key}"] = value
+                
+                wandb.log(log_dict)
             
             # Console logging
             if step % self.training_config.log_every_steps == 0:
@@ -606,18 +614,35 @@ class ArithmeticTrainer:
                 
                 # Log validation metrics to wandb
                 if self.use_wandb:
-                    wandb.log({
+                    val_log_dict = {
                         "val/loss": val_metrics['val_loss'],
                         "val/sequence_accuracy": val_metrics['val_sequence_accuracy'],
                         "val/token_accuracy": val_metrics['val_token_accuracy'],
                         "val/num_tokens": val_metrics['val_tokens'],
                         "val/num_sequences": val_metrics['val_sequences'],
                         "step": step
-                    })
+                    }
+                    
+                    # Add gate alphas during validation as well
+                    if hasattr(self.model, 'transcomputer'):
+                        gate_alphas = self.get_gate_alphas()
+                        for key, value in gate_alphas.items():
+                            val_log_dict[f"gates_val/{key}"] = value
+                    
+                    wandb.log(val_log_dict)
                 
                 print(f"Validation | Loss: {val_metrics['val_loss']:.4f} | "
                       f"SeqAcc: {val_metrics['val_sequence_accuracy']:.4f} | "
                       f"TokAcc: {val_metrics['val_token_accuracy']:.4f}")
+                
+                # Log gate alphas to console if in TransComputer mode
+                if hasattr(self.model, 'transcomputer'):
+                    gate_alphas = self.get_gate_alphas()
+                    print("Gate Alphas:")
+                    print(f"  Perception→Compute: XAttn={gate_alphas['perception_to_compute/avg_cross_attn_gate']:.4f}, "
+                          f"FFN={gate_alphas['perception_to_compute/avg_ffn_gate']:.4f}")
+                    print(f"  Compute→Perception: XAttn={gate_alphas['compute_to_perception/avg_cross_attn_gate']:.4f}, "
+                          f"FFN={gate_alphas['compute_to_perception/avg_ffn_gate']:.4f}")
                 
                 # Generate examples
                 if self.training_config.generate_examples > 0:
@@ -652,6 +677,52 @@ class ArithmeticTrainer:
         # Finish wandb run
         if self.use_wandb:
             wandb.finish()
+
+    def get_gate_alphas(self) -> Dict[str, float]:
+        """Extract gate alpha values from gated cross attention blocks"""
+        gate_alphas = {}
+        
+        # Extract gates if the model has TransComputer (gates exist regardless of n_prog_tokens)
+        if hasattr(self.model, 'transcomputer'):
+            transcomputer = self.model.transcomputer
+            
+            # Extract perception->compute gate alphas (perception_gated_xattn)
+            for i in range(len(transcomputer.perception_gated_xattn)):
+                gated_xattn = transcomputer.perception_gated_xattn[i]
+                # Gate values after tanh activation
+                gate_xattn_val = torch.tanh(gated_xattn.gate_xattn).item()
+                gate_dense_val = torch.tanh(gated_xattn.gate_dense).item()
+                
+                gate_alphas[f"perception_to_compute/layer_{i}/cross_attn_gate"] = gate_xattn_val
+                gate_alphas[f"perception_to_compute/layer_{i}/ffn_gate"] = gate_dense_val
+            
+            # Extract compute->perception gate alphas (compute_gated_xattn)
+            for i in range(len(transcomputer.compute_gated_xattn)):
+                gated_xattn = transcomputer.compute_gated_xattn[i]
+                # Gate values after tanh activation
+                gate_xattn_val = torch.tanh(gated_xattn.gate_xattn).item()
+                gate_dense_val = torch.tanh(gated_xattn.gate_dense).item()
+                
+                gate_alphas[f"compute_to_perception/layer_{i}/cross_attn_gate"] = gate_xattn_val
+                gate_alphas[f"compute_to_perception/layer_{i}/ffn_gate"] = gate_dense_val
+            
+            # Compute average gate values across layers
+            if len(gate_alphas) > 0:  # Only compute averages if we have gates
+                perception_to_compute_xattn_avg = sum(gate_alphas[k] for k in gate_alphas.keys() 
+                                                     if "perception_to_compute" in k and "cross_attn_gate" in k) / self.model_config.n_layers
+                perception_to_compute_ffn_avg = sum(gate_alphas[k] for k in gate_alphas.keys() 
+                                                   if "perception_to_compute" in k and "ffn_gate" in k) / self.model_config.n_layers
+                compute_to_perception_xattn_avg = sum(gate_alphas[k] for k in gate_alphas.keys() 
+                                                     if "compute_to_perception" in k and "cross_attn_gate" in k) / self.model_config.n_layers
+                compute_to_perception_ffn_avg = sum(gate_alphas[k] for k in gate_alphas.keys() 
+                                                   if "compute_to_perception" in k and "ffn_gate" in k) / self.model_config.n_layers
+                
+                gate_alphas["perception_to_compute/avg_cross_attn_gate"] = perception_to_compute_xattn_avg
+                gate_alphas["perception_to_compute/avg_ffn_gate"] = perception_to_compute_ffn_avg
+                gate_alphas["compute_to_perception/avg_cross_attn_gate"] = compute_to_perception_xattn_avg
+                gate_alphas["compute_to_perception/avg_ffn_gate"] = compute_to_perception_ffn_avg
+        
+        return gate_alphas
 
 
 @app.command()
