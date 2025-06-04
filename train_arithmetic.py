@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader
 import time
 import os
 import json
+import random
 from typing import Dict, List, Optional
 from dataclasses import dataclass, asdict
 import typer
@@ -398,81 +399,97 @@ class ArithmeticTrainer:
         op_symbols = {0: "+", 1: "-", 2: "*"}
         
         with torch.no_grad():
-            # Check if validation loader has any batches
-            try:
-                batch_dict = next(iter(self.val_loader))
-                batch_dict = self._move_batch_to_device(batch_dict)
-            except StopIteration:
-                # No validation batches available (due to drop_last=True)
-                # Use training data instead
-                batch_dict = next(iter(self.train_loader))
-                batch_dict = self._move_batch_to_device(batch_dict)
+            # Sample different batches each time for variety
+            val_batches = list(self.val_loader)
+            if not val_batches:
+                # Fallback to training data if no validation batches
+                val_batches = [next(iter(self.train_loader))]
+            
+            # Shuffle batches and take multiple if needed to get enough examples
+            random.shuffle(val_batches)
             
             count = 0
-            for seq_len, batch_data in batch_dict.items():
+            for batch_dict in val_batches:
                 if count >= num_examples:
                     break
+                    
+                batch_dict = self._move_batch_to_device(batch_dict)
                 
-                token_ids = batch_data['token_ids']
-                op_ids = batch_data['op_ids']
-                input_lens = batch_data['input_lens']
-                
-                # Use teacher-forced evaluation (same as validation)
-                loss, logits, mask = self.model.forward(
-                    token_ids=token_ids,
-                    op_ids=op_ids,
-                    input_lens=input_lens,
-                    return_loss=True
-                )
-                
-                # Get predictions from logits
-                predictions = torch.argmax(logits, dim=-1)  # (B, T-1)
-                
-                for i in range(min(token_ids.shape[0], num_examples - count)):
-                    # Get input portion and parse the sequence
-                    input_len = input_lens[i].item()
-                    op_id = op_ids[i].item()
-                    
-                    # Parse operands for display
-                    operands = self._extract_operands_from_sequence(token_ids[i], input_len)
-                    
-                    # Get operation info
-                    op_name = op_names.get(op_id, f"OP{op_id}")
-                    op_symbol = op_symbols.get(op_id, "?")
-                    
-                    # Get target sequence (ground truth)
-                    target_tokens = token_ids[i].cpu().tolist()
-                    target_str = self.tokenizer.detokenize(target_tokens)
-                    
-                    # Get predicted sequence (from teacher-forced logits)
-                    # Reconstruct full sequence: input + predicted output
-                    input_tokens = token_ids[i, :input_len].cpu().tolist()
-                    predicted_output = predictions[i].cpu().tolist()  # This is shifted by 1
-                    
-                    # The predictions correspond to token_ids[:, 1:], so we need to construct
-                    # the full predicted sequence properly
-                    predicted_tokens = input_tokens + predicted_output[input_len-1:]
-                    
-                    # Ensure same length as target
-                    if len(predicted_tokens) < len(target_tokens):
-                        predicted_tokens.extend([self.tokenizer.PAD_TOKEN] * (len(target_tokens) - len(predicted_tokens)))
-                    elif len(predicted_tokens) > len(target_tokens):
-                        predicted_tokens = predicted_tokens[:len(target_tokens)]
-                    
-                    predicted_str = self.tokenizer.detokenize(predicted_tokens)
-                    
-                    # Format the operation description
-                    if operands and len(operands) >= 2:
-                        operation_desc = f"{operands[0]} {op_symbol} {operands[1]} [{op_name}]"
-                    else:
-                        operation_desc = f"[{op_name}]"
-                    
-                    # Simple one-line format
-                    examples.append(f"{operation_desc}: Target='{target_str}', Predicted='{predicted_str}'")
-                    
-                    count += 1
+                for seq_len, batch_data in batch_dict.items():
                     if count >= num_examples:
                         break
+                    
+                    token_ids = batch_data['token_ids']
+                    op_ids = batch_data['op_ids']
+                    input_lens = batch_data['input_lens']
+                    
+                    # Use teacher-forced evaluation (same as validation)
+                    loss, logits, mask = self.model.forward(
+                        token_ids=token_ids,
+                        op_ids=op_ids,
+                        input_lens=input_lens,
+                        return_loss=True
+                    )
+                    
+                    # Get predictions from logits
+                    predictions = torch.argmax(logits, dim=-1)  # (B, T-1)
+                    
+                    # Randomly sample from this batch to add variety
+                    batch_size = token_ids.shape[0]
+                    indices = list(range(batch_size))
+                    random.shuffle(indices)
+                    
+                    for idx in indices:
+                        if count >= num_examples:
+                            break
+                            
+                        i = idx
+                        # Get input portion and parse the sequence
+                        input_len = input_lens[i].item()
+                        op_id = op_ids[i].item()
+                        
+                        # Parse operands for display
+                        operands = self._extract_operands_from_sequence(token_ids[i], input_len)
+                        
+                        # Get operation info
+                        op_name = op_names.get(op_id, f"OP{op_id}")
+                        op_symbol = op_symbols.get(op_id, "?")
+                        
+                        # Get target sequence (ground truth)
+                        target_tokens = token_ids[i].cpu().tolist()
+                        target_str = self.tokenizer.detokenize(target_tokens)
+                        
+                        # Properly reconstruct predicted sequence
+                        # predictions[i] corresponds to token_ids[i, 1:] (next token predictions)
+                        # So predictions[i][j] is the prediction for position j+1
+                        
+                        # Start with the input portion (up to and including "=")
+                        predicted_tokens = token_ids[i, :input_len+1].cpu().tolist()  # Include "=" token
+                        
+                        # Add the predicted output tokens (starting from space after "=")
+                        output_start_pred_idx = input_len  # Index in predictions array for space after "="
+                        predicted_output = predictions[i, output_start_pred_idx:].cpu().tolist()
+                        predicted_tokens.extend(predicted_output)
+                        
+                        # Ensure same length as target for fair comparison
+                        target_len = len(target_tokens)
+                        if len(predicted_tokens) < target_len:
+                            predicted_tokens.extend([self.tokenizer.PAD_TOKEN] * (target_len - len(predicted_tokens)))
+                        elif len(predicted_tokens) > target_len:
+                            predicted_tokens = predicted_tokens[:target_len]
+                        
+                        predicted_str = self.tokenizer.detokenize(predicted_tokens)
+                        
+                        # Format the operation description
+                        if operands and len(operands) >= 2:
+                            operation_desc = f"{operands[0]} {op_symbol} {operands[1]} [{op_name}]"
+                        else:
+                            operation_desc = f"[{op_name}]"
+                        
+                        # Simple one-line format
+                        examples.append(f"{operation_desc}: Target='{target_str}', Predicted='{predicted_str}'")
+                        
+                        count += 1
         
         return examples
     
@@ -657,13 +674,6 @@ class ArithmeticTrainer:
                     print("Examples:")
                     for example in examples[:6]:  # Show first few
                         print(f"  {example}")
-                    
-                    # Log examples to wandb as a table
-                    if self.use_wandb and examples:
-                        example_table = wandb.Table(columns=["Example"])
-                        for example in examples:
-                            example_table.add_data(example)
-                        wandb.log({"examples": example_table, "step": step})
                 
                 # Save best model
                 if val_metrics['val_accuracy'] > self.best_val_accuracy:

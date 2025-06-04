@@ -149,7 +149,7 @@ class ArithmeticModel(nn.Module):
         logits_shifted = logits[:, :-1, :]  # (B, T-1, vocab_size)
         
         # Create mask for output tokens (after "=" + space)
-        start_positions = input_lens + 1  # (B,)
+        start_positions = input_lens  # (B,) - Start from space after "=" (fixed: was input_lens + 1)
         positions = torch.arange(targets.size(1), device=targets.device).unsqueeze(0)  # (1, T-1)
         mask = positions >= start_positions.unsqueeze(1)  # (B, T-1)
         
