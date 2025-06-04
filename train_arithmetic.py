@@ -599,8 +599,8 @@ class ArithmeticTrainer:
                     "step": step
                 }
                 
-                # Add gate alphas if in TransComputer mode
-                if hasattr(self.model, 'transcomputer'):
+                # Add gate alphas if in TransComputer mode and we have program tokens
+                if hasattr(self.model, 'transcomputer') and self.model_config.n_prog_tokens > 0:
                     gate_alphas = self.get_gate_alphas()
                     for key, value in gate_alphas.items():
                         log_dict[f"gates/{key}"] = value
@@ -630,8 +630,8 @@ class ArithmeticTrainer:
                         "step": step
                     }
                     
-                    # Add gate alphas during validation as well
-                    if hasattr(self.model, 'transcomputer'):
+                    # Add gate alphas during validation as well if we have program tokens
+                    if hasattr(self.model, 'transcomputer') and self.model_config.n_prog_tokens > 0:
                         gate_alphas = self.get_gate_alphas()
                         for key, value in gate_alphas.items():
                             val_log_dict[f"gates_val/{key}"] = value
@@ -642,8 +642,8 @@ class ArithmeticTrainer:
                       f"SeqAcc: {val_metrics['val_sequence_accuracy']:.4f} | "
                       f"TokAcc: {val_metrics['val_token_accuracy']:.4f}")
                 
-                # Log gate alphas to console if in TransComputer mode
-                if hasattr(self.model, 'transcomputer'):
+                # Log gate alphas to console if in TransComputer mode and we have program tokens
+                if hasattr(self.model, 'transcomputer') and self.model_config.n_prog_tokens > 0:
                     gate_alphas = self.get_gate_alphas()
                     print("Gate Alphas:")
                     print(f"  Perception→Compute: XAttn={gate_alphas['perception_to_compute/avg_cross_attn_gate']:.4f}, "

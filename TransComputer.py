@@ -378,37 +378,52 @@ class TransComputer(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
-        self.prog_embd = nn.Embedding(config.n_programs, config.d_model * config.n_prog_tokens)
-        self.prog_pos_embd = nn.Embedding(config.n_prog_tokens, config.d_model)
+        
+        # Handle n_prog_tokens=0 case
+        if config.n_prog_tokens == 0:
+            # Create dummy embeddings that won't be used
+            self.prog_embd = nn.Embedding(1, config.d_model)  # Dummy
+            self.prog_pos_embd = nn.Embedding(1, config.d_model)  # Dummy
+            self.register_buffer("pos_ids", torch.zeros(1, 1, dtype=torch.long), persistent=False)
+        else:
+            self.prog_embd = nn.Embedding(config.n_programs, config.d_model * config.n_prog_tokens)
+            self.prog_pos_embd = nn.Embedding(config.n_prog_tokens, config.d_model)
+            self.register_buffer("pos_ids", torch.arange(config.n_prog_tokens).unsqueeze(0), persistent=False)
 
         self.perception_blocks = nn.ModuleList([TransformerBlock(d_model=config.d_model, 
                                                       n_head=config.n_heads, 
                                                       dropout=config.dropout, 
                                                       is_causal=config.causal) for _ in range(config.n_layers)])
         
-        compute_blocks = [ComputeBlock(d_model=config.d_model, 
-                                        n_head=config.n_heads, 
-                                        dropout=config.dropout, 
-                                        is_causal=False,
-                                        num_symbols=config.n_symbols,
-                                        include_ffn=config.include_ffn) for _ in range(config.n_layers)]
-        
-        perception_gxattns = [GatedCrossAttention(embed_dim=config.d_model, 
-                                                num_heads=config.n_heads, 
-                                                ff_hidden_dim=config.d_model * 4, 
-                                                dropout=config.dropout) for _ in range(config.n_layers)]
-        
-        compute_gxattns = [GatedCrossAttention(embed_dim=config.d_model, 
-                                                num_heads=config.n_heads, 
-                                                ff_hidden_dim=config.d_model * 4, 
-                                                dropout=config.dropout) for _ in range(config.n_layers)]
-        
-        self.perception_gated_xattn = nn.ModuleList([perception_gxattns[0]] * config.n_layers if config.shared_compute_block else perception_gxattns)
-        self.compute_gated_xattn = nn.ModuleList([compute_gxattns[0]] * config.n_layers if config.shared_compute_block else compute_gxattns)
-        self.compute_blocks = nn.ModuleList([compute_blocks[0]] * config.n_layers if config.shared_compute_block else compute_blocks)    
+        # Only create compute and cross-attention blocks if we have program tokens
+        if config.n_prog_tokens > 0:
+            compute_blocks = [ComputeBlock(d_model=config.d_model, 
+                                            n_head=config.n_heads, 
+                                            dropout=config.dropout, 
+                                            is_causal=False,
+                                            num_symbols=config.n_symbols,
+                                            include_ffn=config.include_ffn) for _ in range(config.n_layers)]
+            
+            perception_gxattns = [GatedCrossAttention(embed_dim=config.d_model, 
+                                                    num_heads=config.n_heads, 
+                                                    ff_hidden_dim=config.d_model * 4, 
+                                                    dropout=config.dropout) for _ in range(config.n_layers)]
+            
+            compute_gxattns = [GatedCrossAttention(embed_dim=config.d_model, 
+                                                    num_heads=config.n_heads, 
+                                                    ff_hidden_dim=config.d_model * 4, 
+                                                    dropout=config.dropout) for _ in range(config.n_layers)]
+            
+            self.perception_gated_xattn = nn.ModuleList([perception_gxattns[0]] * config.n_layers if config.shared_compute_block else perception_gxattns)
+            self.compute_gated_xattn = nn.ModuleList([compute_gxattns[0]] * config.n_layers if config.shared_compute_block else compute_gxattns)
+            self.compute_blocks = nn.ModuleList([compute_blocks[0]] * config.n_layers if config.shared_compute_block else compute_blocks)
+        else:
+            # Create empty ModuleLists for consistency
+            self.perception_gated_xattn = nn.ModuleList()
+            self.compute_gated_xattn = nn.ModuleList()
+            self.compute_blocks = nn.ModuleList()
             
         self.ln_out = nn.LayerNorm(config.d_model)
-        self.register_buffer("pos_ids", torch.arange(config.n_prog_tokens).unsqueeze(0), persistent=False)
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -446,6 +461,15 @@ class TransComputer(nn.Module):
             assert self.config.n_programs == 1, "input_lens must be provided if n_programs > 1"
             input_lens = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
 
+        # Handle n_prog_tokens=0 case: pure transformer without cross-attention
+        if self.config.n_prog_tokens == 0:
+            # Just run perception blocks without any cross-attention
+            prev_h = x
+            for i in range(self.config.n_layers):
+                prev_h = self.perception_blocks[i](prev_h)
+            return self.ln_out(prev_h)
+
+        # Standard TransComputer with program tokens
         prog = self.prog_embd(prog_ids) # (B, d_model * n_prog_tokens)
         prog = prog.view(x.size(0), -1, self.config.d_model) # (B, n_prog_tokens, d_model)
 
