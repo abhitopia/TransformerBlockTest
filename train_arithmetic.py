@@ -56,6 +56,10 @@ class TrainingConfig:
     val_samples: int = 2000
     operations: List[str] = None  # Will default to ["ADD", "MUL", "SUB"]
     
+    # Data generation optimization
+    use_cache: bool = True
+    num_workers: int = None  # None for auto-detection
+    
     # Training
     batch_size: int = 32
     learning_rate: float = 1e-4
@@ -178,6 +182,8 @@ class ArithmeticTrainer:
             train_samples=self.training_config.train_samples,
             val_samples=self.training_config.val_samples,
             auto_detect_lengths=False,  # Use theoretical max instead
+            use_cache=self.training_config.use_cache,
+            num_workers=self.training_config.num_workers,
             seed=42
         )
         
@@ -738,6 +744,10 @@ def main(
     val_samples: Annotated[int, typer.Option(help="Number of validation samples")] = 2000,
     operations: Annotated[List[str], typer.Option(help="Operations to include (can be specified multiple times)")] = None,
     
+    # Data generation optimization
+    no_cache: Annotated[bool, typer.Option("--no-cache", help="Disable dataset caching")] = False,
+    num_workers: Annotated[Optional[int], typer.Option(help="Number of parallel workers for dataset generation (None for auto)")] = None,
+    
     # Training parameters
     batch_size: Annotated[int, typer.Option(help="Batch size")] = 32,
     learning_rate: Annotated[float, typer.Option(help="Learning rate")] = 1e-4,
@@ -820,6 +830,9 @@ def main(
         val_every_steps=val_every_steps,
         log_every_steps=log_every_steps,
         use_wandb=use_wandb,
+        # Data generation optimization
+        use_cache=not no_cache,
+        num_workers=num_workers,
     )
     
     # Create trainer (this will create the output directory)

@@ -197,3 +197,5 @@ checkpoints/
 
 experiments/
 wandb/
+
+.dataset_cache/
