@@ -9,6 +9,8 @@ Features:
 - Configurable number of operations
 - Adam optimizer
 - Comprehensive logging
+- Weights & Biases integration
+- Flexible project/run organization
 """
 
 import torch
@@ -24,6 +26,13 @@ import typer
 from typing_extensions import Annotated
 from rich import print
 
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("Warning: wandb not available. Install with: pip install wandb")
+
 from arithmetic_model import ArithmeticModel, ArithmeticModelConfig
 from arithmatic_dataset import (
     ArithmeticDatasetGenerator, 
@@ -37,6 +46,10 @@ app = typer.Typer(help="Train ArithmeticModel using TransComputer")
 @dataclass
 class TrainingConfig:
     """Training configuration"""
+    # Experiment organization
+    project: str = "transcomputer-arithmetic"
+    run_name: str = "baseline"
+    
     # Data
     max_digits: int = 2
     train_samples: int = 10000
@@ -60,7 +73,7 @@ class TrainingConfig:
     # Logging
     log_every_steps: int = 100
     save_every_steps: int = 1000
-    output_dir: str = "./checkpoints"
+    use_wandb: bool = True
     
     # Generation (for validation)
     generate_examples: int = 5
@@ -91,8 +104,30 @@ class ArithmeticTrainer:
             print(f"GPU: {torch.cuda.get_device_name()}")
             print(f"CUDA version: {torch.version.cuda}")
         
-        # Create output directory
-        os.makedirs(training_config.output_dir, exist_ok=True)
+        # Create output directory using project/run_name structure
+        self.output_dir = os.path.join("experiments", training_config.project, training_config.run_name)
+        os.makedirs(self.output_dir, exist_ok=True)
+        print(f"Experiment directory: {self.output_dir}")
+        
+        # Initialize wandb if available and requested
+        self.use_wandb = training_config.use_wandb and WANDB_AVAILABLE
+        if self.use_wandb:
+            # Create wandb config combining both model and training configs
+            wandb_config = {
+                **asdict(model_config),
+                **asdict(training_config),
+                "device": str(self.device),
+            }
+            
+            wandb.init(
+                project=training_config.project,
+                name=training_config.run_name,
+                config=wandb_config,
+                save_code=True
+            )
+            print(f"Initialized wandb: {training_config.project}/{training_config.run_name}")
+        elif training_config.use_wandb:
+            print("Warning: wandb requested but not available. Continuing without wandb logging.")
         
         # Initialize tokenizer
         self.tokenizer = ArithmeticTokenizer()
@@ -102,6 +137,13 @@ class ArithmeticTrainer:
         
         # Setup model
         self._setup_model()
+        
+        # Update wandb config with model info
+        if self.use_wandb:
+            wandb.config.update({
+                "total_params": self.model.get_num_params(),
+                "trainable_params": self.model.get_num_trainable_params(),
+            }, allow_val_change=True)
         
         # Setup optimizer
         self._setup_optimizer()
@@ -340,7 +382,7 @@ class ArithmeticTrainer:
         }
     
     def generate_examples(self, num_examples: int = 5) -> List[str]:
-        """Generate example predictions for logging"""
+        """Generate example predictions using teacher-forced evaluation (not autoregressive)"""
         self.model.eval()
         examples = []
         
@@ -368,6 +410,17 @@ class ArithmeticTrainer:
                 op_ids = batch_data['op_ids']
                 input_lens = batch_data['input_lens']
                 
+                # Use teacher-forced evaluation (same as validation)
+                loss, logits, mask = self.model.forward(
+                    token_ids=token_ids,
+                    op_ids=op_ids,
+                    input_lens=input_lens,
+                    return_loss=True
+                )
+                
+                # Get predictions from logits
+                predictions = torch.argmax(logits, dim=-1)  # (B, T-1)
+                
                 for i in range(min(token_ids.shape[0], num_examples - count)):
                     # Get input portion and parse the sequence
                     input_len = input_lens[i].item()
@@ -380,31 +433,23 @@ class ArithmeticTrainer:
                     op_name = op_names.get(op_id, f"OP{op_id}")
                     op_symbol = op_symbols.get(op_id, "?")
                     
-                    # Get input tokens for generation
-                    input_tokens = token_ids[i:i+1, :input_len]  # (1, input_len)
-                    
-                    # Generate solution
-                    generated = self.model.generate(
-                        input_tokens=input_tokens,
-                        op_id=op_id,
-                        input_len=input_len,
-                        max_new_tokens=10,
-                        temperature=0.1
-                    )
-                    
-                    # Get target sequence (fixed length from dataset)
+                    # Get target sequence (ground truth)
                     target_tokens = token_ids[i].cpu().tolist()
                     target_str = self.tokenizer.detokenize(target_tokens)
                     
-                    # Get predicted sequence (ensure same length as target)
-                    predicted_tokens = generated[0].cpu().tolist()
+                    # Get predicted sequence (from teacher-forced logits)
+                    # Reconstruct full sequence: input + predicted output
+                    input_tokens = token_ids[i, :input_len].cpu().tolist()
+                    predicted_output = predictions[i].cpu().tolist()  # This is shifted by 1
                     
-                    # Pad or truncate predicted to match target length
+                    # The predictions correspond to token_ids[:, 1:], so we need to construct
+                    # the full predicted sequence properly
+                    predicted_tokens = input_tokens + predicted_output[input_len-1:]
+                    
+                    # Ensure same length as target
                     if len(predicted_tokens) < len(target_tokens):
-                        # Pad with padding tokens
                         predicted_tokens.extend([self.tokenizer.PAD_TOKEN] * (len(target_tokens) - len(predicted_tokens)))
                     elif len(predicted_tokens) > len(target_tokens):
-                        # Truncate to target length
                         predicted_tokens = predicted_tokens[:len(target_tokens)]
                     
                     predicted_str = self.tokenizer.detokenize(predicted_tokens)
@@ -500,12 +545,12 @@ class ArithmeticTrainer:
         }
         
         # Save regular checkpoint
-        checkpoint_path = os.path.join(self.training_config.output_dir, f"checkpoint_step_{self.step}.pt")
+        checkpoint_path = os.path.join(self.output_dir, f"checkpoint_step_{self.step}.pt")
         torch.save(checkpoint, checkpoint_path)
         
         # Save best model
         if is_best:
-            best_path = os.path.join(self.training_config.output_dir, "best_model.pt")
+            best_path = os.path.join(self.output_dir, "best_model.pt")
             torch.save(checkpoint, best_path)
             print(f"New best model saved with accuracy: {self.best_val_accuracy:.4f}")
     
@@ -535,7 +580,19 @@ class ArithmeticTrainer:
             metrics = self.train_step(batch_dict)
             self.training_metrics.append({**metrics, 'step': step})
             
-            # Logging
+            # Log to wandb
+            if self.use_wandb:
+                wandb.log({
+                    "train/loss": metrics['loss'],
+                    "train/sequence_accuracy": metrics['sequence_accuracy'],
+                    "train/token_accuracy": metrics['token_accuracy'],
+                    "train/learning_rate": metrics['learning_rate'],
+                    "train/num_tokens": metrics['num_tokens'],
+                    "train/num_sequences": metrics['num_sequences'],
+                    "step": step
+                })
+            
+            # Console logging
             if step % self.training_config.log_every_steps == 0:
                 elapsed = time.time() - start_time
                 print(f"Step {step:5d} | Loss: {metrics['loss']:.4f} | "
@@ -547,6 +604,17 @@ class ArithmeticTrainer:
                 val_metrics = self.validate()
                 self.validation_metrics.append({**val_metrics, 'step': step})
                 
+                # Log validation metrics to wandb
+                if self.use_wandb:
+                    wandb.log({
+                        "val/loss": val_metrics['val_loss'],
+                        "val/sequence_accuracy": val_metrics['val_sequence_accuracy'],
+                        "val/token_accuracy": val_metrics['val_token_accuracy'],
+                        "val/num_tokens": val_metrics['val_tokens'],
+                        "val/num_sequences": val_metrics['val_sequences'],
+                        "step": step
+                    })
+                
                 print(f"Validation | Loss: {val_metrics['val_loss']:.4f} | "
                       f"SeqAcc: {val_metrics['val_sequence_accuracy']:.4f} | "
                       f"TokAcc: {val_metrics['val_token_accuracy']:.4f}")
@@ -557,11 +625,22 @@ class ArithmeticTrainer:
                     print("Examples:")
                     for example in examples[:6]:  # Show first few
                         print(f"  {example}")
+                    
+                    # Log examples to wandb as a table
+                    if self.use_wandb and examples:
+                        example_table = wandb.Table(columns=["Example"])
+                        for example in examples:
+                            example_table.add_data(example)
+                        wandb.log({"examples": example_table, "step": step})
                 
                 # Save best model
                 if val_metrics['val_accuracy'] > self.best_val_accuracy:
                     self.best_val_accuracy = val_metrics['val_accuracy']
                     self.save_checkpoint(is_best=True)
+                    
+                    # Log best accuracy to wandb
+                    if self.use_wandb:
+                        wandb.log({"best_val_accuracy": self.best_val_accuracy, "step": step})
             
             # Save checkpoint
             if step % self.training_config.save_every_steps == 0 and step > 0:
@@ -569,33 +648,66 @@ class ArithmeticTrainer:
         
         print("Training completed!")
         print(f"Best validation accuracy: {self.best_val_accuracy:.4f}")
+        
+        # Finish wandb run
+        if self.use_wandb:
+            wandb.finish()
 
 
 @app.command()
 def main(
-    max_digits: Annotated[int, typer.Option(help="Maximum digits for operands")] = 5,
+    # Experiment organization
+    project: Annotated[str, typer.Option(help="Project name for organizing experiments")] = "transcomputer-arithmetic",
+    run_name: Annotated[str, typer.Option(help="Run name for this specific experiment")] = "baseline",
+    use_wandb: Annotated[bool, typer.Option("--wandb/--no-wandb", help="Enable/disable Weights & Biases logging")] = True,
+    
+    # Data parameters
+    max_digits: Annotated[int, typer.Option(help="Maximum digits for operands")] = 2,
     train_samples: Annotated[int, typer.Option(help="Number of training samples")] = 10000,
     val_samples: Annotated[int, typer.Option(help="Number of validation samples")] = 2000,
+    operations: Annotated[List[str], typer.Option(help="Operations to include (can be specified multiple times)")] = None,
+    
+    # Training parameters
     batch_size: Annotated[int, typer.Option(help="Batch size")] = 32,
     learning_rate: Annotated[float, typer.Option(help="Learning rate")] = 1e-4,
     max_steps: Annotated[int, typer.Option(help="Maximum training steps")] = 10000,
+    val_every_steps: Annotated[int, typer.Option(help="Run validation every N steps")] = 500,
+    log_every_steps: Annotated[int, typer.Option(help="Log training metrics every N steps")] = 100,
+    no_compile: Annotated[bool, typer.Option("--no-compile", help="Disable model compilation")] = False,
+    
+    # Model architecture parameters
     d_model: Annotated[int, typer.Option(help="Model dimension")] = 128,
     n_layers: Annotated[int, typer.Option(help="Number of layers")] = 6,
     n_heads: Annotated[int, typer.Option(help="Number of attention heads")] = 8,
-    operations: Annotated[List[str], typer.Option(help="Operations to include (can be specified multiple times)")] = None,
-    output_dir: Annotated[str, typer.Option(help="Output directory")] = "./checkpoints",
-    no_compile: Annotated[bool, typer.Option("--no-compile", help="Disable model compilation")] = False,
-    # Training schedule parameters
-    val_every_steps: Annotated[int, typer.Option(help="Run validation every N steps")] = 500,
-    log_every_steps: Annotated[int, typer.Option(help="Log training metrics every N steps")] = 100,
-    # TransComputer-specific parameters
+    
+    # TransComputer-specific parameters (key experimental variables)
+    n_prog_tokens: Annotated[int, typer.Option(help="Number of program tokens (0=vanilla transformer)")] = 0,
+    compute_steps: Annotated[int, typer.Option(help="Number of compute steps per layer")] = 1,
     n_symbols: Annotated[int, typer.Option(help="Number of symbols in compute block symbol library")] = 100,
     include_ffn: Annotated[bool, typer.Option(help="Include feed-forward network in compute blocks")] = False,
     shared_compute_block: Annotated[bool, typer.Option(help="Share compute block parameters across layers")] = True,
-    n_prog_tokens: Annotated[int, typer.Option(help="Number of program tokens")] = 16,
-    compute_steps: Annotated[int, typer.Option(help="Number of compute steps per layer")] = 3,
 ):
-    """Train ArithmeticModel using TransComputer."""
+    """
+    Train ArithmeticModel using TransComputer.
+    
+    This script is designed for studying the effect of computational blocks.
+    
+    Key experimental parameters:
+    - n_prog_tokens: 0 = vanilla transformer, >0 = TransComputer
+    - compute_steps: Number of computation iterations per layer
+    
+    Examples:
+    
+    Baseline (vanilla transformer):
+    python train_arithmetic.py --project "compute-study" --run-name "baseline" --n-prog-tokens 0
+    
+    TransComputer with varying program tokens:
+    python train_arithmetic.py --project "compute-study" --run-name "prog-tokens-8" --n-prog-tokens 8
+    python train_arithmetic.py --project "compute-study" --run-name "prog-tokens-16" --n-prog-tokens 16
+    
+    TransComputer with varying compute steps:
+    python train_arithmetic.py --project "compute-study" --run-name "compute-steps-3" --n-prog-tokens 8 --compute-steps 3
+    """
     
     # Set default operations if none provided
     if operations is None:
@@ -630,24 +742,25 @@ def main(
         batch_size=batch_size,
         learning_rate=learning_rate,
         max_steps=max_steps,
-        output_dir=output_dir,
+        project=project,
+        run_name=run_name,
         compile_model=not no_compile,
         # Training schedule
         val_every_steps=val_every_steps,
         log_every_steps=log_every_steps,
+        use_wandb=use_wandb,
     )
     
-    # Create output directory
-    os.makedirs(output_dir, exist_ok=True)
+    # Create trainer (this will create the output directory)
+    trainer = ArithmeticTrainer(model_config, training_config)
     
-    # Save configs
-    with open(os.path.join(output_dir, "model_config.json"), "w") as f:
+    # Save configs to the trainer's output directory
+    with open(os.path.join(trainer.output_dir, "model_config.json"), "w") as f:
         json.dump(asdict(model_config), f, indent=2)
-    with open(os.path.join(output_dir, "training_config.json"), "w") as f:
+    with open(os.path.join(trainer.output_dir, "training_config.json"), "w") as f:
         json.dump(asdict(training_config), f, indent=2)
     
-    # Create trainer and start training
-    trainer = ArithmeticTrainer(model_config, training_config)
+    # Start training
     trainer.train()
 
 
