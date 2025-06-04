@@ -381,8 +381,8 @@ class TransComputer(nn.Module):
         
         # Handle n_prog_tokens=0 case
         if config.n_prog_tokens == 0:
-            # Create dummy embeddings that won't be used
-            self.prog_embd = nn.Embedding(1, config.d_model)  # Dummy
+            # Create embeddings for operation conditioning
+            self.prog_embd = nn.Embedding(config.n_programs, config.d_model)  # Operation embeddings
             self.prog_pos_embd = nn.Embedding(1, config.d_model)  # Dummy
             self.register_buffer("pos_ids", torch.zeros(1, 1, dtype=torch.long), persistent=False)
         else:
@@ -461,10 +461,18 @@ class TransComputer(nn.Module):
             assert self.config.n_programs == 1, "input_lens must be provided if n_programs > 1"
             input_lens = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
 
-        # Handle n_prog_tokens=0 case: pure transformer without cross-attention
+        # Handle n_prog_tokens=0 case: pure transformer with operation conditioning
         if self.config.n_prog_tokens == 0:
-            # Just run perception blocks without any cross-attention
-            prev_h = x
+            # Inject program embedding into all input tokens for operation conditioning
+            prog = self.prog_embd(prog_ids)  # (B, d_model * n_prog_tokens)
+            # Since n_prog_tokens=0, this gives us (B, d_model) - the operation embedding
+            prog = prog.view(x.size(0), -1, self.config.d_model)  # (B, 1, d_model)
+            
+            # Add operation conditioning to all input tokens
+            conditioned_x = x + prog  # (B, T, d_model) + (B, 1, d_model) -> (B, T, d_model)
+            
+            # Run perception blocks with conditioned input
+            prev_h = conditioned_x
             for i in range(self.config.n_layers):
                 prev_h = self.perception_blocks[i](prev_h)
             return self.ln_out(prev_h)
