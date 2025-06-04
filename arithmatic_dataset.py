@@ -11,6 +11,7 @@ import os
 import json
 import multiprocessing as mp
 from functools import partial
+import time
 
 try:
     from tqdm import tqdm
@@ -421,20 +422,45 @@ class ArithmeticDatasetGenerator:
                 worker_id
             ))
         
-        # Generate samples in parallel
+        # Generate samples in parallel with progress tracking
         all_samples = []
         total_attempts = 0
         
+        print(f"Generating {num_samples} {split_name} samples using {num_workers} parallel workers...")
+        
+        # Use a progress bar to track worker completion
         if TQDM_AVAILABLE:
-            print(f"Generating {num_samples} {split_name} samples using {num_workers} parallel workers...")
+            pbar = tqdm(total=num_workers, 
+                       desc=f"Workers completed", 
+                       unit="workers",
+                       ncols=100,
+                       leave=True)
         
         with mp.Pool(num_workers) as pool:
-            results = pool.map(_generate_samples_worker, worker_args)
+            # Submit all jobs
+            results = []
+            for args in worker_args:
+                result = pool.apply_async(_generate_samples_worker_with_progress, (args,))
+                results.append(result)
+            
+            # Collect results as they complete
+            for i, result in enumerate(results):
+                samples, worker_id, attempts = result.get()  # This blocks until worker completes
+                all_samples.extend(samples)
+                total_attempts += attempts
+                
+                if TQDM_AVAILABLE:
+                    pbar.update(1)
+                    completed_samples = len(all_samples)
+                    pbar.set_postfix({
+                        "samples": f"{completed_samples}/{num_samples}",
+                        "efficiency": f"{completed_samples/max(total_attempts, 1):.3f}"
+                    })
+                else:
+                    print(f"  Worker {worker_id} completed: {len(samples)} samples")
         
-        # Combine results from all workers
-        for samples, worker_id, attempts in results:
-            all_samples.extend(samples)
-            total_attempts += attempts
+        if TQDM_AVAILABLE:
+            pbar.close()
         
         # Remove duplicates across workers (rare but possible)
         unique_samples = []
@@ -458,6 +484,125 @@ class ArithmeticDatasetGenerator:
             unique_samples.extend(additional_samples)
         
         return unique_samples[:num_samples]  # Ensure exact count
+
+    def _generate_samples_for_split_parallel_enhanced(self, 
+                                                     num_samples: int, 
+                                                     is_train: bool, 
+                                                     train_ratio: float,
+                                                     seed: int,
+                                                     num_workers: int = None) -> List[ArithmeticSample]:
+        """Generate samples with real-time progress tracking across workers"""
+        if num_workers is None:
+            num_workers = min(mp.cpu_count(), 8)
+        
+        if num_samples < 1000:
+            return self._generate_samples_for_split(num_samples, is_train, train_ratio, seed)
+        
+        split_name = "train" if is_train else "val"
+        print(f"🚀 Using {num_workers} workers for parallel {split_name} sample generation...")
+        
+        # Divide work among workers
+        samples_per_worker = num_samples // num_workers
+        remaining_samples = num_samples % num_workers
+        
+        # Create shared progress tracking
+        manager = mp.Manager()
+        progress_counter = manager.Value('i', 0)
+        progress_lock = manager.Lock()
+        
+        # Create worker arguments with progress tracking
+        worker_args = []
+        generator_config = {
+            'max_digits': self.max_digits,
+            'operations': [op.value for op in self.operations]
+        }
+        
+        for worker_id in range(num_workers):
+            worker_samples = samples_per_worker + (1 if worker_id < remaining_samples else 0)
+            worker_args.append((
+                generator_config,
+                worker_samples,
+                is_train,
+                train_ratio,
+                seed,
+                worker_id,
+                progress_counter,
+                progress_lock
+            ))
+        
+        # Start progress monitoring
+        all_samples = []
+        total_attempts = 0
+        
+        print(f"Generating {num_samples} {split_name} samples with real-time progress...")
+        
+        # Progress bar for real-time tracking
+        if TQDM_AVAILABLE:
+            pbar = tqdm(total=num_samples, 
+                       desc=f"Generating {split_name} samples", 
+                       unit="samples",
+                       ncols=100,
+                       leave=True)
+            last_count = 0
+        
+        with mp.Pool(num_workers) as pool:
+            # Submit all jobs
+            results = []
+            for args in worker_args:
+                result = pool.apply_async(_generate_samples_worker_with_progress, (args,))
+                results.append(result)
+            
+            # Monitor progress while workers run
+            completed_workers = 0
+            while completed_workers < num_workers:
+                time.sleep(0.1)  # Check every 100ms
+                
+                # Update progress bar with current count
+                if TQDM_AVAILABLE:
+                    current_count = progress_counter.value
+                    if current_count > last_count:
+                        pbar.update(current_count - last_count)
+                        last_count = current_count
+                
+                # Check for completed workers
+                completed_workers = sum(1 for result in results if result.ready())
+            
+            # Collect final results
+            for result in results:
+                samples, worker_id, attempts = result.get()
+                all_samples.extend(samples)
+                total_attempts += attempts
+        
+        # Ensure progress bar reaches 100%
+        if TQDM_AVAILABLE:
+            final_count = len(all_samples)
+            if final_count > last_count:
+                pbar.update(final_count - last_count)
+            pbar.close()
+        
+        # Remove duplicates across workers
+        unique_samples = []
+        seen_keys = set()
+        
+        for sample in all_samples:
+            key = (sample.operand1, sample.operand2, sample.op_id)
+            if key not in seen_keys:
+                unique_samples.append(sample)
+                seen_keys.add(key)
+        
+        efficiency = len(unique_samples) / max(total_attempts, 1)
+        print(f"✅ Parallel generation completed: {len(unique_samples)}/{num_samples} samples, efficiency: {efficiency:.3f}")
+        
+        # Fill remaining if needed
+        if len(unique_samples) < num_samples:
+            print(f"⚠️  Filling remaining {num_samples - len(unique_samples)} samples...")
+            remaining_needed = num_samples - len(unique_samples)
+            additional_samples = self._generate_samples_for_split(
+                remaining_needed, is_train, train_ratio, seed + 50000
+            )
+            unique_samples.extend(additional_samples)
+        
+        return unique_samples[:num_samples]
 
     def _auto_detect_sequence_lengths(self, sample_size: int = 1000, seed: int = 42) -> List[int]:
         """
@@ -676,7 +821,7 @@ class ArithmeticDatasetGenerator:
         # Generate train and val samples separately
         print("\n[1/3] Generating training samples...")
         if total_samples >= 2000:
-            train_samples_list = self._generate_samples_for_split_parallel(
+            train_samples_list = self._generate_samples_for_split_parallel_enhanced(
                 train_samples, is_train=True, train_ratio=train_ratio, seed=seed, num_workers=num_workers
             )
         else:
@@ -686,7 +831,7 @@ class ArithmeticDatasetGenerator:
         
         print("\n[2/3] Generating validation samples...")
         if total_samples >= 2000:
-            val_samples_list = self._generate_samples_for_split_parallel(
+            val_samples_list = self._generate_samples_for_split_parallel_enhanced(
                 val_samples, is_train=False, train_ratio=train_ratio, seed=seed + 1, num_workers=num_workers
             )
         else:
@@ -972,6 +1117,59 @@ def _generate_samples_worker(args):
                 samples.append(sample)
         
         attempts += 1
+    
+    return samples, worker_id, attempts
+
+
+def _generate_samples_worker_with_progress(args):
+    """Enhanced worker function that can report progress via shared counter"""
+    (generator_config, num_samples, is_train, train_ratio, seed, worker_id, progress_counter, progress_lock) = args
+    
+    # Recreate generator in worker process
+    operations = [BinaryOp(op_val) for op_val in generator_config['operations']]
+    temp_generator = ArithmeticDatasetGenerator(
+        max_digits=generator_config['max_digits'],
+        operations=operations
+    )
+    
+    # Use different seed for each worker to avoid duplicates
+    worker_seed = seed + worker_id * 10000
+    rng = random.Random(worker_seed)
+    
+    samples = []
+    attempts = 0
+    max_attempts = num_samples * 10
+    last_progress_update = 0
+    
+    while len(samples) < num_samples and attempts < max_attempts:
+        sample = temp_generator._generate_random_sample(rng)
+        
+        # Check if this sample belongs to the desired split
+        sample_is_train = temp_generator._is_train_sample(
+            sample.operand1, sample.operand2, 
+            BinaryOp(sample.op_id), train_ratio
+        )
+        
+        if sample_is_train == is_train:
+            # Check for duplicates within this worker's samples
+            sample_key = (sample.operand1, sample.operand2, sample.op_id)
+            if not any(s.operand1 == sample.operand1 and 
+                      s.operand2 == sample.operand2 and 
+                      s.op_id == sample.op_id for s in samples):
+                samples.append(sample)
+                
+                # Update shared progress counter periodically
+                if len(samples) - last_progress_update >= max(1, num_samples // 20):  # Update every 5%
+                    with progress_lock:
+                        progress_counter.value += (len(samples) - last_progress_update)
+                    last_progress_update = len(samples)
+        
+        attempts += 1
+    
+    # Final progress update
+    if len(samples) > last_progress_update:
+        with progress_lock:
+            progress_counter.value += (len(samples) - last_progress_update)
     
     return samples, worker_id, attempts
 
