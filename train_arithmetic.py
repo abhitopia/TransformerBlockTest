@@ -95,7 +95,8 @@ class ArithmeticTrainer:
     def __init__(self, 
                  model_config: ArithmeticModelConfig,
                  training_config: TrainingConfig,
-                 device: Optional[str] = None):
+                 device: Optional[str] = None,
+                 resume_wandb_id: Optional[str] = None):
         self.model_config = model_config
         self.training_config = training_config
         
@@ -125,13 +126,26 @@ class ArithmeticTrainer:
                 "device": str(self.device),
             }
             
-            wandb.init(
-                project=training_config.project,
-                name=training_config.run_name,
-                config=wandb_config,
-                save_code=True
-            )
-            print(f"Initialized wandb: {training_config.project}/{training_config.run_name}")
+            # Handle wandb resuming
+            if resume_wandb_id:
+                print(f"Resuming wandb run: {resume_wandb_id}")
+                wandb.init(
+                    project=training_config.project,
+                    name=training_config.run_name,
+                    config=wandb_config,
+                    save_code=True,
+                    resume="must",
+                    id=resume_wandb_id
+                )
+                print(f"✅ Resumed wandb run: {training_config.project}/{training_config.run_name}")
+            else:
+                wandb.init(
+                    project=training_config.project,
+                    name=training_config.run_name,
+                    config=wandb_config,
+                    save_code=True
+                )
+                print(f"Initialized new wandb run: {training_config.project}/{training_config.run_name}")
         elif training_config.use_wandb:
             print("Warning: wandb requested but not available. Continuing without wandb logging.")
         
@@ -568,6 +582,11 @@ class ArithmeticTrainer:
             'validation_metrics': self.validation_metrics
         }
         
+        # Save wandb run ID if using wandb
+        if self.use_wandb and hasattr(wandb, 'run') and wandb.run is not None:
+            checkpoint['wandb_run_id'] = wandb.run.id
+            checkpoint['wandb_run_name'] = wandb.run.name
+        
         # Save regular checkpoint
         checkpoint_path = os.path.join(self.output_dir, f"checkpoint_step_{self.step}.pt")
         torch.save(checkpoint, checkpoint_path)
@@ -651,17 +670,29 @@ class ArithmeticTrainer:
             print(f"✅ Training state loaded - resuming from step {self.step}")
             print(f"✅ Best validation accuracy: {self.best_val_accuracy:.4f}")
             
-            # Resume wandb if it was being used
-            if self.use_wandb:
-                # Get the wandb run ID if it exists in the checkpoint (for future enhancement)
-                wandb_run_id = checkpoint.get('wandb_run_id', None)
-                if wandb_run_id:
-                    print(f"Note: wandb run ID found in checkpoint: {wandb_run_id}")
-                    print("Consider using wandb.init(resume='must', id=wandb_run_id) for seamless resume")
+            # Return wandb info for resuming
+            wandb_run_id = checkpoint.get('wandb_run_id', None)
+            if wandb_run_id:
+                print(f"✅ Found wandb run ID: {wandb_run_id}")
+            
+            return wandb_run_id
             
         except Exception as e:
             print(f"❌ Error loading checkpoint: {e}")
             raise
+    
+    @staticmethod
+    def load_checkpoint_info(checkpoint_path: str) -> Dict:
+        """Load checkpoint and return wandb info and configs"""
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        return {
+            'wandb_run_id': checkpoint.get('wandb_run_id', None),
+            'wandb_run_name': checkpoint.get('wandb_run_name', None),
+            'model_config': checkpoint['model_config'],
+            'training_config': checkpoint['training_config'],
+            'step': checkpoint['step'],
+            'best_val_accuracy': checkpoint['best_val_accuracy']
+        }
     
     def train(self):
         """Main training loop"""
@@ -847,6 +878,7 @@ def main(
     
     # Resume training
     resume: Annotated[Optional[str], typer.Option(help="Resume from checkpoint (provide checkpoint path or 'latest' for most recent)")] = None,
+    wandb_run_id: Annotated[Optional[str], typer.Option(help="Manually specify wandb run ID to resume (for old checkpoints without saved run ID)")] = None,
     
     # Data parameters
     max_digits: Annotated[int, typer.Option(help="Maximum digits for operands")] = 2,
@@ -943,18 +975,22 @@ def main(
         
         # Load checkpoint to get configs
         typer.echo(f"Loading checkpoint: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        checkpoint_info = ArithmeticTrainer.load_checkpoint_info(checkpoint_path)
         
         # Override CLI args with checkpoint configs (but allow CLI to override if explicitly provided)
-        model_config = ArithmeticModelConfig(**checkpoint['model_config'])
-        training_config = TrainingConfig(**checkpoint['training_config'])
+        model_config = ArithmeticModelConfig(**checkpoint_info['model_config'])
+        training_config = TrainingConfig(**checkpoint_info['training_config'])
         
         # Update training config with any CLI overrides (optional)
         if 'max_steps' in locals() and max_steps != 10000:  # If explicitly provided
             training_config.max_steps = max_steps
         
         # Create trainer and load checkpoint
-        trainer = ArithmeticTrainer(model_config, training_config)
+        trainer = ArithmeticTrainer(
+            model_config, 
+            training_config, 
+            resume_wandb_id=checkpoint_info['wandb_run_id'] or wandb_run_id
+        )
         trainer.load_checkpoint(checkpoint_path)
         
     else:
