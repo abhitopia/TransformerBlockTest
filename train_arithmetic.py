@@ -623,10 +623,51 @@ class ArithmeticTrainer:
         except Exception as e:
             print(f"Warning: Checkpoint cleanup failed: {e}")
     
+    def load_checkpoint(self, checkpoint_path: str):
+        """Load model checkpoint and resume training state"""
+        print(f"Loading checkpoint from: {checkpoint_path}")
+        
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            
+            # Load model state
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            print("✅ Model state loaded")
+            
+            # Load optimizer state
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            print("✅ Optimizer state loaded")
+            
+            # Load scheduler state
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            print("✅ Scheduler state loaded")
+            
+            # Load training state
+            self.step = checkpoint['step']
+            self.best_val_accuracy = checkpoint['best_val_accuracy']
+            self.training_metrics = checkpoint.get('training_metrics', [])
+            self.validation_metrics = checkpoint.get('validation_metrics', [])
+            
+            print(f"✅ Training state loaded - resuming from step {self.step}")
+            print(f"✅ Best validation accuracy: {self.best_val_accuracy:.4f}")
+            
+            # Resume wandb if it was being used
+            if self.use_wandb:
+                # Get the wandb run ID if it exists in the checkpoint (for future enhancement)
+                wandb_run_id = checkpoint.get('wandb_run_id', None)
+                if wandb_run_id:
+                    print(f"Note: wandb run ID found in checkpoint: {wandb_run_id}")
+                    print("Consider using wandb.init(resume='must', id=wandb_run_id) for seamless resume")
+            
+        except Exception as e:
+            print(f"❌ Error loading checkpoint: {e}")
+            raise
+    
     def train(self):
         """Main training loop"""
         print("Starting training...")
         print(f"Max steps: {self.training_config.max_steps}")
+        print(f"Current step: {self.step}")
         print(f"Validation every {self.training_config.val_every_steps} steps")
         print(f"Logging every {self.training_config.log_every_steps} steps")
         
@@ -635,7 +676,17 @@ class ArithmeticTrainer:
         # Create infinite iterator over training data
         train_iter = iter(self.train_loader)
         
-        for step in range(self.training_config.max_steps):
+        # Skip ahead if resuming from checkpoint
+        if self.step > 0:
+            print(f"Fast-forwarding through {self.step} steps...")
+            for _ in range(self.step):
+                try:
+                    next(train_iter)
+                except StopIteration:
+                    train_iter = iter(self.train_loader)
+                    next(train_iter)
+        
+        for step in range(self.step, self.training_config.max_steps):
             self.step = step
             
             try:
@@ -794,6 +845,9 @@ def main(
     run_name: Annotated[str, typer.Option(help="Run name for this specific experiment")] = "baseline",
     use_wandb: Annotated[bool, typer.Option("--wandb/--no-wandb", help="Enable/disable Weights & Biases logging")] = True,
     
+    # Resume training
+    resume: Annotated[Optional[str], typer.Option(help="Resume from checkpoint (provide checkpoint path or 'latest' for most recent)")] = None,
+    
     # Data parameters
     max_digits: Annotated[int, typer.Option(help="Maximum digits for operands")] = 2,
     train_samples: Annotated[int, typer.Option(help="Number of training samples")] = 10000,
@@ -845,62 +899,120 @@ def main(
     
     TransComputer with varying compute steps:
     python train_arithmetic.py --project "compute-study" --run-name "compute-steps-3" --n-prog-tokens 8 --compute-steps 3
+    
+    Resume training:
+    python train_arithmetic.py --resume latest  # Resume from latest checkpoint in same experiment
+    python train_arithmetic.py --resume /path/to/checkpoint.pt  # Resume from specific checkpoint
     """
     
-    # Set default operations if none provided
-    if operations is None:
-        operations = ["ADD", "MUL", "SUB"]
-    
-    # Validate operations
-    valid_operations = {"ADD", "SUB", "MUL"}
-    for op in operations:
-        if op not in valid_operations:
-            typer.echo(f"Error: Invalid operation '{op}'. Valid operations are: {', '.join(valid_operations)}")
-            raise typer.Exit(1)
-    
-    # Create configs
-    model_config = ArithmeticModelConfig(
-        d_model=d_model,
-        n_heads=n_heads,
-        n_layers=n_layers,
-        num_operations=len(operations),
-        # TransComputer-specific parameters
-        n_symbols=n_symbols,
-        include_ffn=include_ffn,
-        shared_compute_block=shared_compute_block,
-        n_prog_tokens=n_prog_tokens,
-        compute_steps=compute_steps,
-    )
-    
-    training_config = TrainingConfig(
-        max_digits=max_digits,
-        train_samples=train_samples,
-        val_samples=val_samples,
-        operations=operations,
-        batch_size=batch_size,
-        learning_rate=learning_rate,
-        max_steps=max_steps,
-        project=project,
-        run_name=run_name,
-        compile_model=not no_compile,
-        # Training schedule
-        val_every_steps=val_every_steps,
-        log_every_steps=log_every_steps,
-        use_wandb=use_wandb,
-        # Data generation optimization
-        use_cache=not no_cache,
-        num_workers=num_workers,
-        max_workers=max_workers,
-    )
-    
-    # Create trainer (this will create the output directory)
-    trainer = ArithmeticTrainer(model_config, training_config)
-    
-    # Save configs to the trainer's output directory
-    with open(os.path.join(trainer.output_dir, "model_config.json"), "w") as f:
-        json.dump(asdict(model_config), f, indent=2)
-    with open(os.path.join(trainer.output_dir, "training_config.json"), "w") as f:
-        json.dump(asdict(training_config), f, indent=2)
+    # Handle resume mode
+    if resume:
+        if resume == "latest":
+            # Find latest checkpoint in experiment directory
+            output_dir = os.path.join("experiments", project, run_name)
+            if not os.path.exists(output_dir):
+                typer.echo(f"Error: Experiment directory not found: {output_dir}")
+                raise typer.Exit(1)
+            
+            # Find latest checkpoint
+            checkpoint_files = []
+            for filepath in os.listdir(output_dir):
+                if filepath.startswith("checkpoint_step_") and filepath.endswith(".pt"):
+                    try:
+                        step_str = filepath.replace("checkpoint_step_", "").replace(".pt", "")
+                        step_num = int(step_str)
+                        full_path = os.path.join(output_dir, filepath)
+                        checkpoint_files.append((step_num, full_path))
+                    except ValueError:
+                        continue
+            
+            if not checkpoint_files:
+                typer.echo(f"Error: No checkpoints found in {output_dir}")
+                raise typer.Exit(1)
+            
+            # Get latest checkpoint
+            checkpoint_files.sort(key=lambda x: x[0], reverse=True)
+            latest_step, checkpoint_path = checkpoint_files[0]
+            typer.echo(f"Resuming from latest checkpoint: step {latest_step}")
+        else:
+            # Use provided checkpoint path
+            checkpoint_path = resume
+            if not os.path.exists(checkpoint_path):
+                typer.echo(f"Error: Checkpoint not found: {checkpoint_path}")
+                raise typer.Exit(1)
+        
+        # Load checkpoint to get configs
+        typer.echo(f"Loading checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        
+        # Override CLI args with checkpoint configs (but allow CLI to override if explicitly provided)
+        model_config = ArithmeticModelConfig(**checkpoint['model_config'])
+        training_config = TrainingConfig(**checkpoint['training_config'])
+        
+        # Update training config with any CLI overrides (optional)
+        if 'max_steps' in locals() and max_steps != 10000:  # If explicitly provided
+            training_config.max_steps = max_steps
+        
+        # Create trainer and load checkpoint
+        trainer = ArithmeticTrainer(model_config, training_config)
+        trainer.load_checkpoint(checkpoint_path)
+        
+    else:
+        # Normal training (not resuming)
+        # Set default operations if none provided
+        if operations is None:
+            operations = ["ADD", "MUL", "SUB"]
+        
+        # Validate operations
+        valid_operations = {"ADD", "SUB", "MUL"}
+        for op in operations:
+            if op not in valid_operations:
+                typer.echo(f"Error: Invalid operation '{op}'. Valid operations are: {', '.join(valid_operations)}")
+                raise typer.Exit(1)
+        
+        # Create configs
+        model_config = ArithmeticModelConfig(
+            d_model=d_model,
+            n_heads=n_heads,
+            n_layers=n_layers,
+            num_operations=len(operations),
+            # TransComputer-specific parameters
+            n_symbols=n_symbols,
+            include_ffn=include_ffn,
+            shared_compute_block=shared_compute_block,
+            n_prog_tokens=n_prog_tokens,
+            compute_steps=compute_steps,
+        )
+        
+        training_config = TrainingConfig(
+            max_digits=max_digits,
+            train_samples=train_samples,
+            val_samples=val_samples,
+            operations=operations,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            max_steps=max_steps,
+            project=project,
+            run_name=run_name,
+            compile_model=not no_compile,
+            # Training schedule
+            val_every_steps=val_every_steps,
+            log_every_steps=log_every_steps,
+            use_wandb=use_wandb,
+            # Data generation optimization
+            use_cache=not no_cache,
+            num_workers=num_workers,
+            max_workers=max_workers,
+        )
+        
+        # Create trainer (this will create the output directory)
+        trainer = ArithmeticTrainer(model_config, training_config)
+        
+        # Save configs to the trainer's output directory
+        with open(os.path.join(trainer.output_dir, "model_config.json"), "w") as f:
+            json.dump(asdict(model_config), f, indent=2)
+        with open(os.path.join(trainer.output_dir, "training_config.json"), "w") as f:
+            json.dump(asdict(training_config), f, indent=2)
     
     # Start training
     trainer.train()
