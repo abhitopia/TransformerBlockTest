@@ -171,13 +171,20 @@ class ComputeBlock(nn.Module):
         self.head_dim = d_model // n_head
         self.num_symbols = num_symbols
         self.include_ffn = include_ffn
-        self.symbol_embeddings = nn.Parameter(torch.randn(num_symbols, self.head_dim).unsqueeze(0).unsqueeze(-2) * 0.02)
+        
+        # Symbol embeddings only if using symbol-based approach
+        if num_symbols > 0:
+            self.symbol_embeddings = nn.Parameter(torch.randn(num_symbols, self.head_dim).unsqueeze(0).unsqueeze(-2) * 0.02)
+            self.kv_proj = nn.Linear(self.head_dim, 2 * self.head_dim, bias=False)
+        else:
+            # Input-derived approach: project input to keys and values
+            self.symbol_embeddings = None
+            self.kv_proj = nn.Linear(self.head_dim, 2 * self.head_dim, bias=False)
         
         self.ln1 = nn.LayerNorm(self.head_dim)
 
         assert d_model % n_head == 0, "d_model must be divisible by n_head"
         self.q_proj = nn.Linear(self.head_dim, self.head_dim, bias=False)
-        self.kv_proj = nn.Linear(self.head_dim, 2 * self.head_dim, bias=False)
 
         self.is_causal = is_causal
         self.dropout_p = dropout
@@ -193,11 +200,18 @@ class ComputeBlock(nn.Module):
 
         x = x.view(batch_size, seq_len, self.num_heads, self.head_dim)  # (B, T, n_head, head_dim)
         q = self.q_proj(self.ln1(x))  # (B, T, n_head, head_dim)
-        k, v = self.kv_proj(self.symbol_embeddings).expand(batch_size, -1, self.num_heads, -1).split(self.head_dim, dim=-1)  # (B, T, n_head, head_dim)
+        
+        if self.num_symbols > 0:
+            # Symbol-based approach (original)
+            k, v = self.kv_proj(self.symbol_embeddings).expand(batch_size, -1, self.num_heads, -1).split(self.head_dim, dim=-1)  # (B, num_symbols, n_head, head_dim)
+        else:
+            # Input-derived approach: keys and values from input
+            kv_input = self.ln1(x)  # Normalize input for K,V projection
+            k, v = self.kv_proj(kv_input).split(self.head_dim, dim=-1)  # (B, T, n_head, head_dim)
 
         q = q.transpose(1, 2)  # (B, n_head, T, head_dim)
-        k = k.transpose(1, 2)  # (B, n_head, T, head_dim)
-        v = v.transpose(1, 2)  # (B, n_head, T, head_dim)
+        k = k.transpose(1, 2)  # (B, n_head, *, head_dim) - * is num_symbols or T
+        v = v.transpose(1, 2)  # (B, n_head, *, head_dim) - * is num_symbols or T
 
         attn_output = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout_p, is_causal=self.is_causal)  # (B, n_head, T, head_dim)
 

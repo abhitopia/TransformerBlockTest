@@ -110,6 +110,9 @@ class ArithmeticTrainer:
         if self.device.type == "cuda":
             print(f"GPU: {torch.cuda.get_device_name()}")
             print(f"CUDA version: {torch.version.cuda}")
+            # Set matmul precision to high for faster training on modern GPUs
+            torch.set_float32_matmul_precision('high')
+            print("✅ Set matmul precision to 'high' for faster CUDA training")
         
         # Create output directory using project/run_name structure
         self.output_dir = os.path.join("experiments", training_config.project, training_config.run_name)
