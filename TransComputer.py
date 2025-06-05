@@ -29,8 +29,8 @@ class GatedCrossAttention(nn.Module):
 
         # Cross-Attention module
         self.cross_attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
-        # Gate (scalar) for cross-attn, initialized to 0 → tanh(0)=0
-        self.gate_xattn = nn.Parameter(torch.zeros(1))
+        # Gate (scalar) for cross-attn, initialized to small positive value to encourage usage
+        self.gate_xattn = nn.Parameter(torch.ones(1) * 0.1)
 
         # ------------------------------------------------------------
         # 2) PreNorm LayerNorm for Feed-Forward
@@ -41,8 +41,8 @@ class GatedCrossAttention(nn.Module):
         self.fc1 = nn.Linear(embed_dim, ff_hidden_dim)
         self.activation = nn.GELU()
         self.fc2 = nn.Linear(ff_hidden_dim, embed_dim)
-        # Gate (scalar) for dense sublayer, initialized to 0 → tanh(0)=0
-        self.gate_dense = nn.Parameter(torch.zeros(1))
+        # Gate (scalar) for dense sublayer, initialized to small positive value to encourage usage  
+        self.gate_dense = nn.Parameter(torch.ones(1) * 0.1)
 
         # Optional dropout
         self.dropout = nn.Dropout(dropout) if dropout > 0 else None
