@@ -913,6 +913,7 @@ def main(
     n_symbols: Annotated[int, typer.Option(help="Number of symbols in compute block symbol library")] = 100,
     include_ffn: Annotated[bool, typer.Option(help="Include feed-forward network in compute blocks")] = False,
     shared_compute_block: Annotated[bool, typer.Option(help="Share compute block parameters across layers")] = True,
+    causal_compute: Annotated[bool, typer.Option(help="Enable causal attention in compute blocks for sequential processing")] = False,
 ):
     """
     Train ArithmeticModel using TransComputer.
@@ -922,6 +923,7 @@ def main(
     Key experimental parameters:
     - n_prog_tokens: 0 = vanilla transformer, >0 = TransComputer
     - compute_steps: Number of computation iterations per layer
+    - causal_compute: Enable causal attention in compute blocks for sequential processing
     
     Examples:
     
@@ -931,6 +933,9 @@ def main(
     TransComputer with varying program tokens:
     python train_arithmetic.py --project "compute-study" --run-name "prog-tokens-8" --n-prog-tokens 8
     python train_arithmetic.py --project "compute-study" --run-name "prog-tokens-16" --n-prog-tokens 16
+    
+    TransComputer with causal compute blocks (sequential processing):
+    python train_arithmetic.py --project "compute-study" --run-name "causal-compute" --n-prog-tokens 8 --causal-compute
     
     TransComputer with varying compute steps:
     python train_arithmetic.py --project "compute-study" --run-name "compute-steps-3" --n-prog-tokens 8 --compute-steps 3
@@ -1021,6 +1026,7 @@ def main(
             shared_compute_block=shared_compute_block,
             n_prog_tokens=n_prog_tokens,
             compute_steps=compute_steps,
+            causal_compute=causal_compute,
         )
         
         training_config = TrainingConfig(

@@ -29,6 +29,7 @@ class ArithmeticModelConfig:
     shared_compute_block: bool = True
     n_prog_tokens: int = 16
     compute_steps: int = 3
+    causal_compute: bool = False  # Enable causal attention in compute blocks
     
     # Task specific
     vocab_size: int = 13  # From ArithmeticTokenizer
@@ -75,7 +76,8 @@ class ArithmeticModel(nn.Module):
             n_programs=config.num_operations,
             d_model=config.d_model,
             n_heads=config.n_heads,
-            dropout=config.dropout
+            dropout=config.dropout,
+            causal_compute=config.causal_compute
         )
         
         # TransComputer backbone

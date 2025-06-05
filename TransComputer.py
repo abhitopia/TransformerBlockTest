@@ -164,13 +164,14 @@ class TransformerBlock(nn.Module):
     
 
 class ComputeBlock(nn.Module):
-    def __init__(self, d_model, n_head, dropout: float = 0.0, is_causal: bool = False, num_symbols: int = 100, include_ffn: bool = False):
+    def __init__(self, d_model, n_head, dropout: float = 0.0, is_causal: bool = False, num_symbols: int = 100, include_ffn: bool = False, causal_cross_head: bool = False):
         super().__init__()
         self.d_model = d_model
         self.num_heads = n_head
         self.head_dim = d_model // n_head
         self.num_symbols = num_symbols
         self.include_ffn = include_ffn
+        self.causal_cross_head = causal_cross_head
         
         # Symbol embeddings only if using symbol-based approach
         if num_symbols > 0:
@@ -221,7 +222,7 @@ class ComputeBlock(nn.Module):
         qkv_h = self.qkv_proj_h(attn_output)  # (B, T, n_head, 3 * head_dim)
         q_h, k_h, v_h = qkv_h.split(self.head_dim, dim=-1)  # (B, T, n_head, head_dim)
 
-        attn_output_h = F.scaled_dot_product_attention(q_h, k_h, v_h, dropout_p=self.dropout_p, is_causal=False)  # (B, T, n_head, head_dim)
+        attn_output_h = F.scaled_dot_product_attention(q_h, k_h, v_h, dropout_p=self.dropout_p, is_causal=self.causal_cross_head)  # (B, T, n_head, head_dim)
         x = x + attn_output_h
         if self.include_ffn:
             x = x + self.ffn(self.ln2(x))
@@ -373,6 +374,7 @@ class Config:
     n_symbols: int = 100
     include_ffn: bool = False
     shared_compute_block: bool = True
+    causal_compute: bool = False  # Enable causal attention in compute blocks
 
     # Program
 
@@ -414,9 +416,10 @@ class TransComputer(nn.Module):
             compute_blocks = [ComputeBlock(d_model=config.d_model, 
                                             n_head=config.n_heads, 
                                             dropout=config.dropout, 
-                                            is_causal=False,
+                                            is_causal=config.causal_compute,
                                             num_symbols=config.n_symbols,
-                                            include_ffn=config.include_ffn) for _ in range(config.n_layers)]
+                                            include_ffn=config.include_ffn,
+                                            causal_cross_head=config.causal_compute) for _ in range(config.n_layers)]
             
             perception_gxattns = [GatedCrossAttention(embed_dim=config.d_model, 
                                                     num_heads=config.n_heads, 
