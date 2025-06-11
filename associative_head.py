@@ -7,29 +7,29 @@ underlying substrate for Key, Query, and Value operations. Symbols are defined
 as tuples of subsymbols, and the head is constructed via rules.
 
 Architecture:
-- Key Memory: Maps input symbols to key representations
-- Query Memory: Maps input symbols to query representations  
-- Value Memory: Maps key symbols to value representations
-- Attention computed via associative strength between queries and keys
+- Phase 1: AssociativeHeadBuilder - Rule construction and matrix building
+- Phase 2: AssociativeHead - PyTorch tensor operations
 
 Example usage:
-    head = AssociativeHead(vector_dim=512, composition_method="binding")
+    # Phase 1: Build the head with rules
+    builder = AssociativeHeadBuilder(vector_dim=512, composition_method="binding")
     
     # Add linking rules (affects Key and Query memories)
-    head.add_linking_rule(("subject", "person"), ("object", "person"))
-    head.add_linking_rule(("verb", "see"), ("object", "visible"))
+    builder.add_linking_rule(("subject", "person"), ("verb", "action"))
+    builder.add_value_rule(("verb", "action"), ("feature", "dynamic"))
     
-    # Add value rules (affects Value memory)
-    head.add_value_rule(("object", "person"), ("feature", "animate"))
-    head.add_value_rule(("object", "visible"), ("feature", "visual"))
+    # Finalize to get torch module
+    head = builder.build()
     
-    # Forward pass
-    tokens = [("subject", "person"), ("verb", "see"), ("object", "book")]
-    output = head.forward(tokens)
+    # Phase 2: Use as standard attention head
+    x = torch.randn(batch_size, seq_len, vector_dim)
+    output = head(x)
 """
 
 import numpy as np
+import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional, Union
 from dataclasses import dataclass
 import warnings
@@ -256,28 +256,6 @@ class TupleHeteroassociativeMemory:
         self.association_matrix += self.learning_rate * np.outer(output_vector, input_vector)
         self.associations.append((input_tuple, output_tuple))
     
-    def recall(self, input_tuple: Tuple[str, ...]) -> Optional[Tuple[str, ...]]:
-        """Recall the tuple associated with the input tuple."""
-        if self.association_matrix is None:
-            return None
-        
-        input_vector = self._get_tuple_vector(input_tuple)
-        activation = self.association_matrix @ input_vector
-        
-        # Find best match among learned output tuples
-        best_match = None
-        best_similarity = self.retrieval_threshold
-        
-        for _, output_tuple in self.associations:
-            output_vector = self._get_tuple_vector(output_tuple)
-            similarity = np.dot(activation, output_vector)
-            
-            if similarity > best_similarity:
-                best_similarity = similarity
-                best_match = output_tuple
-        
-        return best_match
-    
     def get_activation(self, input_tuple: Tuple[str, ...]) -> np.ndarray:
         """Get the raw activation vector for an input tuple."""
         if self.association_matrix is None:
@@ -285,29 +263,11 @@ class TupleHeteroassociativeMemory:
         
         input_vector = self._get_tuple_vector(input_tuple)
         return self.association_matrix @ input_vector
-    
-    def get_association_strength(self, input_tuple: Tuple[str, ...], 
-                                output_tuple: Tuple[str, ...]) -> float:
-        """Get the strength of association between two tuples."""
-        if self.association_matrix is None:
-            return 0.0
-        
-        input_vector = self._get_tuple_vector(input_tuple)
-        output_vector = self._get_tuple_vector(output_tuple)
-        
-        activation = self.association_matrix @ input_vector
-        return np.dot(activation, output_vector)
 
-class AssociativeHead(nn.Module):
+class AssociativeHeadBuilder:
     """
-    Attention head implemented using heteroassociative memories.
-    
-    The head consists of three heteroassociative memories:
-    - Key Memory: Maps input symbols to key representations
-    - Query Memory: Maps input symbols to query representations  
-    - Value Memory: Maps key symbols to value representations
-    
-    Attention is computed via associative strength between queries and keys.
+    Builder for constructing associative attention heads via rules.
+    Handles the rule-based construction phase.
     """
     
     def __init__(self,
@@ -319,7 +279,7 @@ class AssociativeHead(nn.Module):
                  retrieval_threshold: float = 0.3,
                  temperature: float = 1.0):
         """
-        Initialize associative attention head.
+        Initialize associative head builder.
         
         Args:
             vector_dim: Dimensionality of vectors
@@ -330,8 +290,6 @@ class AssociativeHead(nn.Module):
             retrieval_threshold: Minimum activation threshold
             temperature: Temperature for attention softmax
         """
-        super().__init__()
-        
         # Shared vector factory
         self.vector_factory = OrthogonalVectorFactory(
             vector_dim=vector_dim,
@@ -353,21 +311,21 @@ class AssociativeHead(nn.Module):
             self.composer, learning_rate, retrieval_threshold, "ValueMemory"
         )
         
-        # Attention parameters
+        # Parameters
         self.temperature = temperature
         self.vector_dim = vector_dim
         
         # Rule tracking
         self.linking_rules: List[Tuple[Tuple[str, ...], Tuple[str, ...]]] = []
         self.value_rules: List[Tuple[Tuple[str, ...], Tuple[str, ...]]] = []
+        
+        # Symbol library for output interpretation
+        self.symbol_library: Dict[str, np.ndarray] = {}
     
     def add_linking_rule(self, query_symbol: Tuple[str, ...], key_symbol: Tuple[str, ...],
                         use_shared_intermediate: bool = True):
         """
         Add a linking rule that creates associations between query and key symbols.
-        
-        This implements the dual-memory linkage strategy where both query and key
-        symbols are linked to the same intermediate representation for strong correlation.
         
         Args:
             query_symbol: Tuple symbol that should attend to key_symbol
@@ -377,23 +335,18 @@ class AssociativeHead(nn.Module):
         if use_shared_intermediate:
             # Create shared intermediate symbol
             intermediate = ("link", f"{query_symbol}_{key_symbol}")
+            # Learn associations to shared intermediate
+            self.query_memory.learn_association(query_symbol, intermediate)
+            self.key_memory.learn_association(key_symbol, intermediate)
         else:
             # Create separate intermediates
             query_intermediate = ("query_int", str(query_symbol))
             key_intermediate = ("key_int", str(key_symbol))
-            
             self.query_memory.learn_association(query_symbol, query_intermediate)
             self.key_memory.learn_association(key_symbol, key_intermediate)
-            self.linking_rules.append((query_symbol, key_symbol))
-            return
-        
-        # Learn associations to shared intermediate
-        self.query_memory.learn_association(query_symbol, intermediate)
-        self.key_memory.learn_association(key_symbol, intermediate)
         
         self.linking_rules.append((query_symbol, key_symbol))
-        
-        print(f"Added linking rule: {query_symbol} <-> {key_symbol} via {intermediate}")
+        print(f"Added linking rule: {query_symbol} <-> {key_symbol}")
     
     def add_value_rule(self, key_symbol: Tuple[str, ...], value_symbol: Tuple[str, ...]):
         """
@@ -405,163 +358,413 @@ class AssociativeHead(nn.Module):
         """
         self.value_memory.learn_association(key_symbol, value_symbol)
         self.value_rules.append((key_symbol, value_symbol))
-        
         print(f"Added value rule: {key_symbol} -> {value_symbol}")
     
-    def compute_attention_weights(self, tokens: List[Tuple[str, ...]]) -> np.ndarray:
+    def add_symbol_to_library(self, symbol: Tuple[str, ...]):
+        """Add a symbol to the library for output interpretation."""
+        symbol_key = str(symbol)
+        if symbol_key not in self.symbol_library:
+            self.symbol_library[symbol_key] = self.composer.compose(symbol)
+    
+    def create_input_tensor(self, symbols: List[Tuple[str, ...]], batch_size: int = 1) -> torch.Tensor:
         """
-        Compute attention weights between all pairs of tokens using associative strength.
+        Create input tensor from list of symbol tuples.
         
         Args:
-            tokens: List of tuple symbols (input sequence)
+            symbols: List of symbol tuples to convert to tensor
+            batch_size: Number of batches
             
         Returns:
-            Attention weight matrix of shape (seq_len, seq_len)
+            Input tensor of shape (batch_size, seq_len, vector_dim)
         """
-        seq_len = len(tokens)
-        attention_matrix = np.zeros((seq_len, seq_len))
+        seq_len = len(symbols)
+        input_tensor = torch.zeros(batch_size, seq_len, self.vector_dim)
         
-        for i, query_token in enumerate(tokens):
-            # Get query activation
-            query_activation = self.query_memory.get_activation(query_token)
+        for i, symbol in enumerate(symbols):
+            # Add to library if not present
+            self.add_symbol_to_library(symbol)
             
-            for j, key_token in enumerate(tokens):
-                # Get key activation  
-                key_activation = self.key_memory.get_activation(key_token)
-                
-                # Compute attention as dot product of activations
-                attention_score = np.dot(query_activation, key_activation)
-                attention_matrix[i, j] = attention_score
+            # Get composed vector for symbol
+            symbol_vector = self.composer.compose(symbol)
+            symbol_tensor = torch.from_numpy(symbol_vector).float()
+            
+            # Set for all batches
+            for b in range(batch_size):
+                input_tensor[b, i, :] = symbol_tensor
         
-        # Apply temperature and softmax
-        attention_matrix = attention_matrix / self.temperature
-        
-        # Softmax per row
-        for i in range(seq_len):
-            row = attention_matrix[i, :]
-            row_max = np.max(row)
-            exp_row = np.exp(row - row_max)  # Numerical stability
-            attention_matrix[i, :] = exp_row / np.sum(exp_row)
-        
-        return attention_matrix
+        return input_tensor
     
-    def forward(self, tokens: List[Tuple[str, ...]]) -> List[np.ndarray]:
+    def build(self) -> 'AssociativeHead':
         """
-        Forward pass of the associative attention head.
+        Build the final AssociativeHead PyTorch module.
         
-        Args:
-            tokens: List of tuple symbols (input sequence)
-            
         Returns:
-            List of attended output vectors, one per input token
+            AssociativeHead: Ready-to-use PyTorch attention head
         """
-        # Compute attention weights
-        attention_weights = self.compute_attention_weights(tokens)
+        # Build symbol library from all used symbols
+        all_symbols = set()
         
-        # Get value vectors for all tokens
-        value_vectors = []
-        for token in tokens:
-            # Try to get value via value memory
-            value_activation = self.value_memory.get_activation(token)
-            
-            # If no strong value activation, use the token's own vector
-            if np.linalg.norm(value_activation) < 0.1:
-                value_activation = self.composer.compose(token)
-            
-            value_vectors.append(value_activation)
+        # Add symbols from linking rules
+        for query_sym, key_sym in self.linking_rules:
+            all_symbols.add(query_sym)
+            all_symbols.add(key_sym)
         
-        # Compute attended outputs
-        attended_outputs = []
-        for i in range(len(tokens)):
-            attended_vector = np.zeros(self.vector_dim)
-            
-            # Weighted sum of values
-            for j in range(len(tokens)):
-                attended_vector += attention_weights[i, j] * value_vectors[j]
-            
-            attended_outputs.append(attended_vector)
+        # Add symbols from value rules  
+        for key_sym, value_sym in self.value_rules:
+            all_symbols.add(key_sym)
+            all_symbols.add(value_sym)
         
-        return attended_outputs
-    
-    def get_statistics(self) -> Dict:
-        """Get comprehensive statistics about the attention head."""
-        return {
-            'vector_dim': self.vector_dim,
-            'composition_method': self.composer.method,
-            'num_linking_rules': len(self.linking_rules),
-            'num_value_rules': len(self.value_rules),
-            'num_symbols': len(self.vector_factory.vectors),
-            'key_memory_associations': len(self.key_memory.associations),
-            'query_memory_associations': len(self.query_memory.associations),
-            'value_memory_associations': len(self.value_memory.associations),
-            'linking_rules': self.linking_rules,
-            'value_rules': self.value_rules
-        }
-    
-    def visualize_attention(self, tokens: List[Tuple[str, ...]], 
-                           attention_weights: Optional[np.ndarray] = None) -> None:
-        """Visualize attention weights as a matrix."""
-        if attention_weights is None:
-            attention_weights = self.compute_attention_weights(tokens)
+        # Add to library
+        for symbol in all_symbols:
+            self.add_symbol_to_library(symbol)
         
-        print("\nAttention Matrix:")
-        print("Rows = Query tokens, Columns = Key tokens")
-        print("    " + "  ".join(f"{str(t)[:8]:>8}" for t in tokens))
+        # Extract matrices
+        query_matrix = self.query_memory.association_matrix
+        key_matrix = self.key_memory.association_matrix  
+        value_matrix = self.value_memory.association_matrix
         
-        for i, query_token in enumerate(tokens):
-            row_str = f"{str(query_token)[:8]:>8} "
-            row_str += "  ".join(f"{attention_weights[i,j]:>8.3f}" for j in range(len(tokens)))
-            print(row_str)
+        # Handle None matrices
+        if query_matrix is None:
+            query_matrix = np.eye(self.vector_dim)
+        if key_matrix is None:
+            key_matrix = np.eye(self.vector_dim)
+        if value_matrix is None:
+            value_matrix = np.eye(self.vector_dim)
+        
+        return AssociativeHead(
+            query_matrix=query_matrix,
+            key_matrix=key_matrix,
+            value_matrix=value_matrix,
+            symbol_library=self.symbol_library,
+            temperature=self.temperature,
+            vector_dim=self.vector_dim,
+            builder=self  # Pass builder for testing
+        )
 
-# Example usage and testing
-if __name__ == "__main__":
-    print("=== Associative Attention Head Demo ===\n")
+class AssociativeHead(nn.Module):
+    """
+    PyTorch attention head that uses pre-built associative memory matrices.
+    Operates on standard (B,T,D) tensors.
+    """
     
-    # Create attention head
-    head = AssociativeHead(
+    def __init__(self,
+                 query_matrix: np.ndarray,
+                 key_matrix: np.ndarray, 
+                 value_matrix: np.ndarray,
+                 symbol_library: Dict[str, np.ndarray],
+                 temperature: float = 1.0,
+                 vector_dim: int = 512,
+                 builder: Optional['AssociativeHeadBuilder'] = None):
+        """
+        Initialize PyTorch attention head with pre-built matrices.
+        
+        Args:
+            query_matrix: Pre-built query transformation matrix
+            key_matrix: Pre-built key transformation matrix
+            value_matrix: Pre-built value transformation matrix
+            symbol_library: Library of known symbols for output interpretation
+            temperature: Temperature for attention softmax
+            vector_dim: Vector dimensionality
+            builder: Reference to builder for testing (optional)
+        """
+        super().__init__()
+        
+        # Convert matrices to PyTorch parameters
+        self.query_matrix = nn.Parameter(torch.from_numpy(query_matrix).float(), requires_grad=False)
+        self.key_matrix = nn.Parameter(torch.from_numpy(key_matrix).float(), requires_grad=False)
+        self.value_matrix = nn.Parameter(torch.from_numpy(value_matrix).float(), requires_grad=False)
+        
+        # Store symbol library
+        self.symbol_library = {k: torch.from_numpy(v).float() for k, v in symbol_library.items()}
+        self.temperature = temperature
+        self.vector_dim = vector_dim
+        self.builder = builder  # For testing
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of associative attention.
+        
+        Args:
+            x: Input tensor of shape (B, T, D)
+            
+        Returns:
+            Output tensor of shape (B, T, D)
+        """
+        B, T, D = x.shape
+        
+        # Compute queries, keys, values using associative matrices
+        # Q = x @ query_matrix^T (since matrix was built as output @ input^T)
+        queries = x @ self.query_matrix.T  # (B, T, D)
+        keys = x @ self.key_matrix.T       # (B, T, D)
+        values = x @ self.value_matrix.T   # (B, T, D)
+        
+        # Compute attention scores
+        scores = torch.matmul(queries, keys.transpose(-2, -1)) / self.temperature  # (B, T, T)
+        
+        # Apply softmax
+        attention_weights = F.softmax(scores, dim=-1)  # (B, T, T)
+        
+        # Apply attention to values
+        output = torch.matmul(attention_weights, values)  # (B, T, D)
+        
+        return output
+    
+    def forward_with_attention(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass that also returns attention weights for analysis.
+        
+        Args:
+            x: Input tensor of shape (B, T, D)
+            
+        Returns:
+            Tuple of (output, attention_weights)
+        """
+        B, T, D = x.shape
+        
+        # Compute queries, keys, values using associative matrices
+        queries = x @ self.query_matrix.T  # (B, T, D)
+        keys = x @ self.key_matrix.T       # (B, T, D)
+        values = x @ self.value_matrix.T   # (B, T, D)
+        
+        # Compute attention scores
+        scores = torch.matmul(queries, keys.transpose(-2, -1)) / self.temperature  # (B, T, T)
+        
+        # Apply softmax
+        attention_weights = F.softmax(scores, dim=-1)  # (B, T, T)
+        
+        # Apply attention to values
+        output = torch.matmul(attention_weights, values)  # (B, T, D)
+        
+        return output, attention_weights
+    
+    def interpret_output(self, output_vector: torch.Tensor, top_k: int = 5) -> List[Tuple[str, float]]:
+        """
+        Interpret an output vector by finding closest symbols in the library.
+        Assumes output is additive composition of symbols.
+        
+        Args:
+            output_vector: Single output vector of shape (D,)
+            top_k: Number of top symbols to return
+            
+        Returns:
+            List of (symbol, similarity_score) tuples
+        """
+        if output_vector.dim() > 1:
+            output_vector = output_vector.squeeze()
+        
+        similarities = []
+        
+        for symbol_str, symbol_vec in self.symbol_library.items():
+            # Compute cosine similarity
+            similarity = F.cosine_similarity(
+                output_vector.unsqueeze(0), 
+                symbol_vec.unsqueeze(0)
+            ).item()
+            similarities.append((symbol_str, similarity))
+        
+        # Sort by similarity and return top k
+        similarities.sort(key=lambda x: x[1], reverse=True)
+        return similarities[:top_k]
+    
+    def interpret_batch_output(self, output: torch.Tensor, top_k: int = 5) -> List[List[Tuple[str, float]]]:
+        """
+        Interpret a batch of output vectors.
+        
+        Args:
+            output: Output tensor of shape (B, T, D) or (T, D)
+            top_k: Number of top symbols per position
+            
+        Returns:
+            List of interpretations for each position
+        """
+        if output.dim() == 3:
+            # Handle batch dimension - just take first batch item
+            output = output[0]  # (T, D)
+        
+        interpretations = []
+        for t in range(output.shape[0]):
+            interp = self.interpret_output(output[t], top_k)
+            interpretations.append(interp)
+        
+        return interpretations
+
+def test_associative_rules():
+    """
+    Test that the associative head correctly implements the rules we defined.
+    """
+    print("=" * 80)
+    print("=== TESTING ASSOCIATIVE RULES ===")
+    print("=" * 80)
+    
+    # Create builder with rules
+    builder = AssociativeHeadBuilder(
         vector_dim=256,
         composition_method="binding",
         temperature=1.0
     )
     
-    print("Creating attention head with associative memories...")
+    # Define rules
+    print("Setting up rules:")
     
-    # Add some linking rules (what should attend to what)
+    # Linking rules: who should attend to whom
+    builder.add_linking_rule(("subject", "person"), ("verb", "action"))
+    builder.add_linking_rule(("verb", "see"), ("object", "visible"))
+    builder.add_linking_rule(("adjective", "red"), ("object", "ball"))
+    
+    # Value rules: what should be retrieved when attending
+    builder.add_value_rule(("verb", "action"), ("feature", "dynamic"))
+    builder.add_value_rule(("object", "visible"), ("feature", "visual"))
+    builder.add_value_rule(("object", "ball"), ("feature", "round"))
+    
+    # Build head
+    print("\nBuilding head...")
+    head = builder.build()
+    
+    # Test 1: Simple two-token test
+    print("\n" + "="*50)
+    print("TEST 1: Two tokens with direct linking")
+    print("="*50)
+    
+    symbols = [("subject", "person"), ("verb", "action")]
+    input_tensor = builder.create_input_tensor(symbols)
+    
+    print(f"Input symbols: {symbols}")
+    print(f"Expected: ('subject', 'person') should attend to ('verb', 'action')")
+    print(f"Expected output[0] should contain ('feature', 'dynamic')")
+    
+    output, attention = head.forward_with_attention(input_tensor)
+    
+    print(f"\nAttention weights:")
+    print(f"  {symbols[0]} -> {symbols[0]}: {attention[0,0,0]:.3f}")
+    print(f"  {symbols[0]} -> {symbols[1]}: {attention[0,0,1]:.3f}")
+    print(f"  {symbols[1]} -> {symbols[0]}: {attention[0,1,0]:.3f}")
+    print(f"  {symbols[1]} -> {symbols[1]}: {attention[0,1,1]:.3f}")
+    
+    interpretations = head.interpret_batch_output(output)
+    print(f"\nOutput interpretations:")
+    for i, (symbol, interp) in enumerate(zip(symbols, interpretations)):
+        print(f"  Position {i} ({symbol}):")
+        for sym_str, score in interp[:3]:
+            print(f"    {sym_str}: {score:.3f}")
+    
+    # Test 2: Three-token chain
+    print("\n" + "="*50)
+    print("TEST 2: Three-token attention chain")
+    print("="*50)
+    
+    symbols = [("verb", "see"), ("object", "visible"), ("adjective", "red")]
+    input_tensor = builder.create_input_tensor(symbols)
+    
+    print(f"Input symbols: {symbols}")
+    print(f"Expected: ('verb', 'see') should attend to ('object', 'visible')")
+    print(f"Expected output[0] should contain ('feature', 'visual')")
+    
+    output, attention = head.forward_with_attention(input_tensor)
+    
+    print(f"\nAttention weights (first row - 'verb see' attending to others):")
+    for j, target in enumerate(symbols):
+        print(f"  ('verb', 'see') -> {target}: {attention[0,0,j]:.3f}")
+    
+    interpretations = head.interpret_batch_output(output)
+    print(f"\nOutput interpretations:")
+    for i, (symbol, interp) in enumerate(zip(symbols, interpretations)):
+        print(f"  Position {i} ({symbol}):")
+        for sym_str, score in interp[:3]:
+            print(f"    {sym_str}: {score:.3f}")
+    
+    # Test 3: Full sentence test
+    print("\n" + "="*50)
+    print("TEST 3: Full sentence with multiple rules")
+    print("="*50)
+    
+    symbols = [
+        ("subject", "person"), 
+        ("verb", "see"), 
+        ("adjective", "red"), 
+        ("object", "ball")
+    ]
+    input_tensor = builder.create_input_tensor(symbols)
+    
+    print(f"Input symbols: {symbols}")
+    print("Expected attention patterns:")
+    print("  - ('subject', 'person') -> ('verb', 'action') [but 'action' not in input]")
+    print("  - ('verb', 'see') -> ('object', 'visible') [but 'visible' not in input]") 
+    print("  - ('adjective', 'red') -> ('object', 'ball')")
+    
+    output, attention = head.forward_with_attention(input_tensor)
+    
+    print(f"\nAttention matrix:")
+    print("     " + "".join(f"{str(s)[:12]:>12}" for s in symbols))
+    for i, query in enumerate(symbols):
+        row_str = f"{str(query)[:12]:>12} "
+        row_str += "".join(f"{attention[0,i,j]:>12.3f}" for j in range(len(symbols)))
+        print(row_str)
+    
+    interpretations = head.interpret_batch_output(output)
+    print(f"\nOutput interpretations:")
+    for i, (symbol, interp) in enumerate(zip(symbols, interpretations)):
+        print(f"  Position {i} ({symbol}):")
+        for sym_str, score in interp[:3]:
+            print(f"    {sym_str}: {score:.3f}")
+    
+    print("\n" + "="*80)
+    print("Analysis:")
+    print("- High attention weights indicate successful rule matching")
+    print("- Output interpretations show retrieved features/values")
+    print("- Position 2 ('adjective', 'red') should attend strongly to position 3 ('object', 'ball')")
+    print("- Position 3's output should then contain ('feature', 'round')")
+    print("="*80)
+
+# Example usage and testing
+if __name__ == "__main__":
+    print("=== Associative Attention Head Builder Demo ===\n")
+    
+    # Phase 1: Build the head with rules
+    print("Phase 1: Building head with rules...")
+    builder = AssociativeHeadBuilder(
+        vector_dim=256,
+        composition_method="binding",
+        temperature=1.0
+    )
+    
+    # Add linking rules (what should attend to what)
     print("\nAdding linking rules:")
-    head.add_linking_rule(("subject", "person"), ("verb", "action"))
-    head.add_linking_rule(("verb", "see"), ("object", "visible"))
-    head.add_linking_rule(("adjective", "color"), ("object", "thing"))
+    builder.add_linking_rule(("subject", "person"), ("verb", "action"))
+    builder.add_linking_rule(("verb", "see"), ("object", "visible"))
+    builder.add_linking_rule(("adjective", "color"), ("object", "thing"))
     
     # Add value rules (what should be retrieved when attending)
     print("\nAdding value rules:")
-    head.add_value_rule(("verb", "action"), ("feature", "dynamic"))
-    head.add_value_rule(("object", "visible"), ("feature", "visual"))
-    head.add_value_rule(("object", "thing"), ("feature", "physical"))
+    builder.add_value_rule(("verb", "action"), ("feature", "dynamic"))
+    builder.add_value_rule(("object", "visible"), ("feature", "visual"))
+    builder.add_value_rule(("object", "thing"), ("feature", "physical"))
     
-    # Test with a sentence
-    print("\nTesting attention on sentence tokens:")
-    tokens = [
-        ("subject", "person"),
-        ("verb", "see"),
-        ("adjective", "red"),
-        ("object", "ball")
-    ]
+    # Build the PyTorch head
+    print("\nBuilding PyTorch module...")
+    head = builder.build()
     
-    print(f"Input tokens: {tokens}")
+    # Phase 2: Use as standard PyTorch attention head
+    print("\nPhase 2: Using as PyTorch attention head...")
     
-    # Compute attention
-    attention_weights = head.compute_attention_weights(tokens)
-    head.visualize_attention(tokens, attention_weights)
+    # Create input tensors
+    batch_size, seq_len, vector_dim = 2, 4, 256
+    x = torch.randn(batch_size, seq_len, vector_dim)
+    
+    print(f"Input shape: {x.shape}")
     
     # Forward pass
-    outputs = head.forward(tokens)
-    print(f"\nOutput vectors shape: {[out.shape for out in outputs]}")
+    output = head(x)
+    print(f"Output shape: {output.shape}")
     
-    # Show statistics
-    stats = head.get_statistics()
-    print(f"\nHead Statistics:")
-    print(f"  Vector dimension: {stats['vector_dim']}")
-    print(f"  Composition method: {stats['composition_method']}")
-    print(f"  Linking rules: {stats['num_linking_rules']}")
-    print(f"  Value rules: {stats['num_value_rules']}")
-    print(f"  Total symbols: {stats['num_symbols']}") 
+    # Interpret outputs
+    print("\nInterpreting outputs (first batch, all positions):")
+    interpretations = head.interpret_batch_output(output)
+    
+    for i, interp in enumerate(interpretations):
+        print(f"Position {i}:")
+        for symbol, score in interp:
+            print(f"  {symbol}: {score:.3f}")
+        print()
+    
+    # Run comprehensive rule testing
+    test_associative_rules() 
