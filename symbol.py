@@ -240,7 +240,7 @@ class SymbolConcatenate(BlockModule):
 class SymbolResidual(BlockModule):
     pass
 
-class SymbolTransformer(BlockModule):
+class SymbolTransformerBlock(BlockModule):
     def __init__(self, n_heads: int, d_model: int):
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
         d_head = d_model // n_heads
@@ -256,42 +256,99 @@ class SymbolTransformer(BlockModule):
         assert len(head_links) == len(head_values) == len(self.heads), "head_links, head_values and heads must have the same length"
         head_outputs = []
         for head_input, head, head_link, head_value in zip(head_inputs, self.heads, head_links, head_values):
-            head_output = head(head_input, head_link, head_value)
+            head_output = head(head_input, links=head_link, values=head_value)
             head_outputs.append(head_output)
         
         # combined_output = self.concat(head_outputs)
         # residual = self.residual(input_symbols, combined_output)
 
 
+def create_multiplier(M: int, N: int, T: int, n_heads: int, d_model: int):
+    assert T >= M+N, "number of token positions must be greater than or equal to the sum of multiplier and multiplicand positions"
 
-if __name__ == "__main__":
-
-    d_model = 128
-    n_heads = 4
-    d_head = d_model // n_heads
-
+    # Create base symbols
     symbols = SymbolRegistry(dim=d_model)
-    
-    # Lets' consider the case of multiplication
-
-    # for multiplying N digit x M digits natural numbers
-    # We need a base symbol for each digit
-
-    M = 3
-    N = 2
-
-    # Register all the digits
     for d in range(10):
         symbols.register(f"D{d}")
 
-    # Register all the positions, multiplication of N digit by M digit can result in a (N+M) digit number
+    # Position of the digit
     for i in range(M+N):
         symbols.register(f"P{i}")
+    symbols.register("Multiplicand")
+    symbols.register("Multiplier")
 
-    # Register location, there can be multipicand or multiplier
-    symbols.register("L0")
-    symbols.register("L1")
+    # Token positions
+    for i in range(T):
+        symbols.register(f"T{i}")
+
+    m = max(M, N)
+    n = min(M, N)
 
 
-    transformer = SymbolTransformer(n_heads=n_heads, d_model=d_model)
-    transformer(symbols)
+    # Example
+    #      1234
+    #    x  567
+    # ---------  L0
+    # H0:  7777
+    # H1:  1234
+    # H2:  0000  (Previous Carry)
+    # ---------
+    # FF:  7418  (Base Multiply)
+    #      0122  (Carry)
+    # --------- L1
+    # 
+
+    # number of layers is n
+    for layer in range(1):
+        transformer_block = SymbolTransformerBlock(n_heads=n_heads, d_model=d_model)
+        multiplier_pos = f"P{layer}"
+
+        # Head 0: Collect active multiplier digit for each token position
+        head_0_links = []
+        for tloc in range(T):
+            # For each of first m positions, we want to collect the active multiplier digit
+            if tloc < m:
+                query_label = f"T{tloc}"
+                key_label = ("Multiplier", multiplier_pos)
+                head_0_links.append(Link(query_label=query_label, key_label=key_label))
+
+        head_0_values = []
+        # collect the digit from multiplier and multiplicand
+        for d in range(10):
+            head_0_values.append(Value(label=("Multiplier", f"D{d}"), value_label=f"Multiplier{d}"))
+
+        # Head 1: Collect all the multiplicand digits
+        head_1_links = []
+        for tloc in range(T):
+            if tloc < m:
+                query_label = f"T{tloc}"
+                key_label = ("Multiplicand", f"P{tloc}") 
+                head_1_links.append(Link(query_label=query_label, key_label=key_label))
+
+        for d in range(10):
+            head_0_values.append(Value(label=("Multiplicand", f"D{d}"), value_label=f"Multiplicand{d}"))
+
+
+        # Head 2: Matches with previous token and extract the carry digit
+        head_2_links = []
+        for tloc in range(T):
+            if tloc > 0:
+                query_label = f"T{tloc}"
+                key_label = f"T{tloc-1}"
+                head_2_links.append(Link(query_label=query_label, key_label=key_label))
+
+        head_2_values = []
+        # For first layer, carry is always 0
+        if layer == 0:
+            for tloc in range(T):
+                head_2_values.append(Value(label=f"T{tloc}", value_label=f"Carry{0}"))
+        else:
+            for d in range(10):
+                head_2_values.append(Value(label=f"Carry{d}", value_label=f"Carry{d}"))
+
+        
+
+if __name__ == "__main__":
+
+    create_multiplier(M=3, N=2, n_heads=4, d_model=128)
+    pass
